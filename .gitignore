@@ -16,6 +16,7 @@ local.properties
 *.log
 __pycache__/
 *.pyc
+gb10-host/data/
 
 .gradle-user/
 .gradle-user-2/

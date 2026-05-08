@@ -3,6 +3,7 @@ package com.example.smartglassesagents.network
 import com.example.smartglassesagents.experiment.HostConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -29,11 +30,23 @@ class Gb10ApiClient(private val hostConfig: HostConfig) {
             }
         }
 
+    suspend fun getModels(): Result<List<ModelProfile>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val json = requestJson(path = "/models", method = "GET")
+            val modelsJson = json.optJSONArray("models") ?: JSONArray()
+            buildList {
+                for (index in 0 until modelsJson.length()) {
+                    add(ModelProfile.fromJson(modelsJson.getJSONObject(index)))
+                }
+            }
+        }
+    }
+
     private fun requestJson(path: String, method: String, body: JSONObject? = null): JSONObject {
         val normalizedBase = hostConfig.baseUrl.trim().trimEnd('/')
         val connection = (URL("$normalizedBase$path").openConnection() as HttpURLConnection).apply {
             requestMethod = method
-            connectTimeout = 5_000
+            connectTimeout = 15_000
             readTimeout = 30_000
             setRequestProperty("Accept", "application/json")
             if (hostConfig.pairingToken.isNotBlank()) {

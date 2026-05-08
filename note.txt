@@ -1,0 +1,40 @@
+You cannot stream from the glasses yet because the repo is only ready for the real DAT path, but the external Meta setup is not complete locally.
+
+The blocking points are:
+
+1. **You are likely still running `mockDatDebug`**
+   The real glasses stream only exists in the `realDatDebug` flavor. The app should show `Build: real` in the DAT panel. If it says `mock`, it will never stream real glasses video.
+
+2. **The real DAT build is currently blocked**
+   Our preflight showed missing:
+   - `GITHUB_TOKEN` or `github_token`
+   - `META_WEARABLES_APPLICATION_ID` or `meta_wearables_application_id`
+
+   Without those, Gradle cannot build the real Meta DAT SDK path.
+
+3. **Meta DAT requires Developer Center app registration**
+   The official DAT README says the SDK is developer preview and requires Developer Center setup, project/release channel, and app registration. It also requires the manifest `com.meta.wearable.mwdat.APPLICATION_ID`. Source: Meta DAT README lines on Developer Center and application ID setup: https://github.com/facebook/meta-wearables-dat-android
+
+4. **The SDK dependency setup is token-gated**
+   Meta’s README says the SDK artifacts require a classic GitHub token with `read:packages`, supplied as `GITHUB_TOKEN` or `github_token` in `local.properties`. Source: https://github.com/facebook/meta-wearables-dat-android
+
+5. **Version mismatch risk**
+   The current official README shows `mwdat = "0.6.0"`, while this repo is pinned to `0.3.0`. That may be okay if your local cloned sample is 0.3.0, but if you’re following the live GitHub docs, we should update the repo to `0.6.0` and fix any API changes.
+
+6. **Our app does not continuously upload raw video**
+   Even after DAT streaming works, the app currently uses the stream to get frames on Android, then sends sampled still frames to GB10. That is intentional for latency/privacy/backpressure. The SDK supports video streaming/photo capture to the Android app, but our experiment pipeline does not yet forward continuous video to GB10.
+
+The immediate next command is:
+
+```powershell
+Copy-Item local.properties.example local.properties
+notepad local.properties
+```
+
+Fill in `github_token` and `meta_wearables_application_id`, then run:
+
+```powershell
+.\scripts\check-real-dat-setup.ps1 -Build
+```
+
+After that, install `realDatDebug`, confirm the app says `Build: real`, then use `Register`, `Grant camera`, `Start session`, and `Capture DAT`.

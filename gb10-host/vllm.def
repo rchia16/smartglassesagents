@@ -1,0 +1,678 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/vllm:26.04-py3
+
+%labels
+    Purpose GB10 vLLM + Ollama local vision benchmark container
+    Base nvcr.io/nvidia/vllm:26.04-py3
+
+%help
+    GB10 / Grace-Blackwell Apptainer image supporting:
+      - NVIDIA vLLM OpenAI-compatible serving
+      - Nemotron Nano 12B V2 VL
+      - Qwen2.5-VL-72B
+      - Ollama local multimodal models
+      - Persistent cache/model storage under:
+          $HOME/models/
+
+    ============================================================
+    QUICK START — NEMOTRON VL
+    ============================================================
+
+    Build image:
+
+      apptainer build ~/containers/vllm.sif vllm.def
+
+    Start Nemotron VL server:
+
+      apptainer exec --nv \
+        --bind "$HOME:$HOME" \
+        ~/containers/vllm.sif \
+        start-vllm-nemotron-vl
+
+    The server exposes an OpenAI-compatible endpoint:
+
+      http://127.0.0.1:8000/v1
+
+    Default runtime settings:
+
+      MODEL:
+        nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16
+
+      ATTENTION BACKEND:
+        TRITON_ATTN
+
+      MAX MODEL LENGTH:
+        16384
+
+      GPU MEMORY UTILIZATION:
+        0.85
+
+    ============================================================
+    VERIFY SERVER
+    ============================================================
+
+    Health check:
+
+      curl http://127.0.0.1:8000/health
+
+    List models:
+
+      curl http://127.0.0.1:8000/v1/models | jq .
+
+    ============================================================
+    TEXT GENERATION TEST
+    ============================================================
+
+      curl http://127.0.0.1:8000/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d '{
+          "model": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Say hello from Nemotron VL on GB10."
+            }
+          ],
+          "temperature": 0,
+          "max_tokens": 64
+        }' | jq .
+
+    Or use helper:
+
+      test-vllm
+
+    ============================================================
+    VISION TEST
+    ============================================================
+
+    Built-in helper:
+
+      test-vllm-vision ./image.jpg
+
+    Explicit curl example:
+
+      IMG_B64=$(base64 -w 0 ./image.jpg)
+
+      curl http://127.0.0.1:8000/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"model\": \"nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16\",
+          \"messages\": [
+            {
+              \"role\": \"user\",
+              \"content\": [
+                {
+                  \"type\": \"text\",
+                  \"text\": \"Describe this image. Include visible text, objects, layout, and uncertainty.\"
+                },
+                {
+                  \"type\": \"image_url\",
+                  \"image_url\": {
+                    \"url\": \"data:image/jpeg;base64,${IMG_B64}\"
+                  }
+                }
+              ]
+            }
+          ],
+          \"temperature\": 0,
+          \"max_tokens\": 512
+        }" | jq .
+
+    ============================================================
+    RUNTIME OVERRIDES
+    ============================================================
+
+    Larger context:
+
+      apptainer exec --nv \
+        --bind "$HOME:$HOME" \
+        --env VLLM_MAX_MODEL_LEN=32768 \
+        --env VLLM_GPU_MEMORY_UTILIZATION=0.92 \
+        ~/containers/vllm.sif \
+        start-vllm-nemotron-vl
+
+    Different attention backend:
+
+      --env VLLM_ATTENTION_BACKEND=FLASHINFER
+
+    or:
+
+      --env VLLM_ATTENTION_BACKEND=TORCH_SDPA
+
+    Current recommended backend:
+
+      TRITON_ATTN
+
+    ============================================================
+    OPTIONAL API KEY
+    ============================================================
+
+    Start protected API:
+
+      apptainer exec --nv \
+        --bind "$HOME:$HOME" \
+        --env VLLM_API_KEY=testkey \
+        ~/containers/vllm.sif \
+        start-vllm-nemotron-vl
+
+    Use with:
+
+      curl http://127.0.0.1:8000/v1/models \
+        -H "Authorization: Bearer testkey"
+
+    ============================================================
+    CACHE / MODEL STORAGE
+    ============================================================
+
+    Persistent storage locations:
+
+      $HOME/models/ollama
+      $HOME/models/huggingface
+      $HOME/models/vllm
+
+    Nemotron model weights and HuggingFace cache persist across
+    container rebuilds.
+
+    ============================================================
+    DEBUGGING
+    ============================================================
+
+    Show installed models and environment:
+
+      list-local-models
+
+    Verify CUDA:
+
+      /usr/bin/python3 - <<'PY'
+      import torch
+      print("cuda available:", torch.cuda.is_available())
+      print("device count:", torch.cuda.device_count())
+      if torch.cuda.is_available():
+          print(torch.cuda.get_device_name(0))
+      PY
+
+    ============================================================
+    OLLAMA SUPPORT
+    ============================================================
+
+    Start Ollama:
+
+      start-ollama
+
+    Pull local models:
+
+      pull-local-llama-fast
+      pull-local-gemma-fast
+      pull-local-gemma-detail
+
+    Test Ollama:
+
+      MODEL=local_gemma_fast test-ollama
+
+    Vision test:
+
+      test-ollama-vision ./image.jpg local_gemma_detail
+
+%post
+    set -eux
+
+    if command -v dnf >/dev/null 2>&1; then
+        dnf install -y \
+            curl ca-certificates git jq procps-ng \
+            python3 python3-pip python3-virtualenv \
+            which findutils tar gzip zstd
+        dnf clean all
+
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y \
+            curl ca-certificates git jq procps-ng \
+            python3 python3-pip python3-virtualenv \
+            which findutils tar gzip zstd
+        yum clean all
+
+    elif command -v microdnf >/dev/null 2>&1; then
+        microdnf install -y \
+            curl ca-certificates git jq procps-ng \
+            python3 python3-pip \
+            which findutils tar gzip zstd
+        microdnf clean all
+
+    elif command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+            curl ca-certificates git jq procps \
+            python3 python3-pip python3-venv \
+            which findutils tar gzip zstd
+        rm -rf /var/lib/apt/lists/*
+
+    else
+        echo "No supported package manager found" >&2
+        exit 1
+    fi
+
+    mkdir -p /opt/gb10/bin /opt/gb10/venv /workspace
+
+    python3 -m venv /opt/gb10/venv
+
+    /opt/gb10/venv/bin/python -m pip install --no-cache-dir --upgrade pip
+    /opt/gb10/venv/bin/python -m pip install --no-cache-dir \
+        "setuptools>=77.0.3,<81.0.0" \
+        wheel \
+        "openai>=1.0.0" \
+        requests \
+        pillow \
+        numpy \
+        pandas \
+        matplotlib
+
+    curl -fsSL https://ollama.com/install.sh | sh
+
+    cat > /opt/gb10/bin/start-ollama <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+export OLLAMA_MODELS="${OLLAMA_MODELS:-$HOME/models/ollama}"
+
+mkdir -p "$OLLAMA_MODELS"
+
+echo "OLLAMA_HOST=${OLLAMA_HOST}"
+echo "OLLAMA_MODELS=${OLLAMA_MODELS}"
+
+exec ollama serve
+EOF
+
+    cat > /opt/gb10/bin/pull-local-llama-fast <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+export OLLAMA_MODELS="${OLLAMA_MODELS:-$HOME/models/ollama}"
+
+ollama pull llama3.2-vision:11b
+
+cat > /tmp/Modelfile.local_llama_fast <<'MODEL'
+FROM llama3.2-vision:11b
+
+PARAMETER temperature 0
+PARAMETER num_ctx 8192
+
+SYSTEM """
+You are local_llama_fast, a fast local vision-language baseline model.
+Prioritize concise, reliable image understanding. Do not over-explain.
+"""
+MODEL
+
+ollama create local_llama_fast -f /tmp/Modelfile.local_llama_fast
+EOF
+
+    cat > /opt/gb10/bin/pull-local-gemma-fast <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+export OLLAMA_MODELS="${OLLAMA_MODELS:-$HOME/models/ollama}"
+
+GEMMA_FAST_MODEL="${GEMMA_FAST_MODEL:-gemma3:12b}"
+
+ollama pull "$GEMMA_FAST_MODEL"
+
+cat > /tmp/Modelfile.local_gemma_fast <<MODEL
+FROM ${GEMMA_FAST_MODEL}
+
+PARAMETER temperature 0
+PARAMETER num_ctx 8192
+
+SYSTEM """
+You are local_gemma_fast, a fast local Gemma vision-language baseline.
+Prioritize concise visual reasoning, visible text extraction, and low-latency responses.
+"""
+MODEL
+
+ollama create local_gemma_fast -f /tmp/Modelfile.local_gemma_fast
+EOF
+
+    cat > /opt/gb10/bin/pull-local-gemma-detail <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+export OLLAMA_MODELS="${OLLAMA_MODELS:-$HOME/models/ollama}"
+
+GEMMA_DETAIL_MODEL="${GEMMA_DETAIL_MODEL:-gemma3:27b}"
+
+ollama pull "$GEMMA_DETAIL_MODEL"
+
+cat > /tmp/Modelfile.local_gemma_detail <<MODEL
+FROM ${GEMMA_DETAIL_MODEL}
+
+PARAMETER temperature 0
+PARAMETER num_ctx 16384
+
+SYSTEM """
+You are local_gemma_detail, a more detailed local Gemma vision-language model.
+Prioritize careful visual inspection, document details, visible text, spatial relationships,
+and explicit uncertainty.
+"""
+MODEL
+
+ollama create local_gemma_detail -f /tmp/Modelfile.local_gemma_detail
+EOF
+
+    cat > /opt/gb10/bin/pull-all-ollama-models <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+pull-local-llama-fast
+pull-local-gemma-fast
+pull-local-gemma-detail
+EOF
+
+    cat > /opt/gb10/bin/start-vllm-nemotron-vl <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HF_HOME="${HF_HOME:-$HOME/models/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HOME/models/huggingface/hub}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$HOME/models/vllm}"
+export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-TRITON_ATTN}"
+
+mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$VLLM_CACHE_ROOT"
+
+MODEL_ID="${MODEL_ID:-nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16}"
+HOST="${VLLM_HOST:-0.0.0.0}"
+PORT="${VLLM_PORT:-8000}"
+DTYPE="${VLLM_DTYPE:-bfloat16}"
+MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-16384}"
+GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
+
+API_KEY_ARGS=()
+if [ -n "${VLLM_API_KEY:-}" ]; then
+    API_KEY_ARGS+=(--api-key "${VLLM_API_KEY}")
+fi
+
+echo "MODEL_ID=${MODEL_ID}"
+echo "VLLM_MAX_MODEL_LEN=${MAX_MODEL_LEN}"
+echo "VLLM_GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}"
+echo "VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND}"
+echo "HF_HOME=${HF_HOME}"
+echo "VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}"
+
+/usr/bin/python3 -m vllm.entrypoints.openai.api_server \
+    --host "${HOST}" \
+    --port "${PORT}" \
+    --model "${MODEL_ID}" \
+    --dtype "${DTYPE}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+    --trust-remote-code \
+    "${API_KEY_ARGS[@]}" \
+    "$@"
+EOF
+
+    cat > /opt/gb10/bin/start-vllm-qwen25-vl-72b <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HF_HOME="${HF_HOME:-$HOME/models/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HOME/models/huggingface/hub}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$HOME/models/vllm}"
+export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-TRITON_ATTN}"
+
+mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$VLLM_CACHE_ROOT"
+
+MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-VL-72B-Instruct}"
+HOST="${VLLM_HOST:-0.0.0.0}"
+PORT="${VLLM_PORT:-8000}"
+DTYPE="${VLLM_DTYPE:-bfloat16}"
+MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-16384}"
+GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+
+API_KEY_ARGS=()
+if [ -n "${VLLM_API_KEY:-}" ]; then
+    API_KEY_ARGS+=(--api-key "${VLLM_API_KEY}")
+fi
+
+echo "MODEL_ID=${MODEL_ID}"
+echo "VLLM_MAX_MODEL_LEN=${MAX_MODEL_LEN}"
+echo "VLLM_GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}"
+echo "VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND}"
+echo "VLLM_TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE}"
+echo "HF_HOME=${HF_HOME}"
+echo "VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}"
+
+/usr/bin/python3 -m vllm.entrypoints.openai.api_server \
+    --host "${HOST}" \
+    --port "${PORT}" \
+    --model "${MODEL_ID}" \
+    --dtype "${DTYPE}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+    --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
+    --trust-remote-code \
+    "${API_KEY_ARGS[@]}" \
+    "$@"
+EOF
+
+    cat > /opt/gb10/bin/test-vllm <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
+MODEL="${MODEL:-nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16}"
+AUTH_ARGS=()
+
+if [ -n "${VLLM_API_KEY:-}" ]; then
+    AUTH_ARGS=(-H "Authorization: Bearer ${VLLM_API_KEY}")
+fi
+
+curl -s "${BASE_URL}/chat/completions" \
+  -H "Content-Type: application/json" \
+  "${AUTH_ARGS[@]}" \
+  -d "{
+    \"model\": \"${MODEL}\",
+    \"messages\": [
+      {
+        \"role\": \"user\",
+        \"content\": \"Say hello from vLLM on GB10.\"
+      }
+    ],
+    \"temperature\": 0,
+    \"max_tokens\": 64
+  }" | jq .
+EOF
+
+    cat > /opt/gb10/bin/test-vllm-vision <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+    echo "Usage: test-vllm-vision /path/to/image.jpg [model]" >&2
+    exit 1
+fi
+
+IMAGE_PATH="$1"
+MODEL="${2:-nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
+AUTH_ARGS=()
+
+if [ -n "${VLLM_API_KEY:-}" ]; then
+    AUTH_ARGS=(-H "Authorization: Bearer ${VLLM_API_KEY}")
+fi
+
+if base64 --help 2>&1 | grep -q -- '-w'; then
+    IMG_B64="$(base64 -w 0 "$IMAGE_PATH")"
+else
+    IMG_B64="$(base64 < "$IMAGE_PATH" | tr -d '\n')"
+fi
+
+curl -s "${BASE_URL}/chat/completions" \
+  -H "Content-Type: application/json" \
+  "${AUTH_ARGS[@]}" \
+  -d "{
+    \"model\": \"${MODEL}\",
+    \"messages\": [
+      {
+        \"role\": \"user\",
+        \"content\": [
+          {
+            \"type\": \"text\",
+            \"text\": \"Describe this image. Include visible text, objects, layout, and uncertainty.\"
+          },
+          {
+            \"type\": \"image_url\",
+            \"image_url\": {
+              \"url\": \"data:image/jpeg;base64,${IMG_B64}\"
+            }
+          }
+        ]
+      }
+    ],
+    \"temperature\": 0,
+    \"max_tokens\": 512
+  }" | jq .
+EOF
+
+    cat > /opt/gb10/bin/test-ollama <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+
+MODEL="${MODEL:-local_llama_fast}"
+
+curl -s "http://${OLLAMA_HOST}/api/generate" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"${MODEL}\",
+    \"prompt\": \"Say hello from ${MODEL} on GB10.\",
+    \"stream\": false
+  }" | jq .
+EOF
+
+    cat > /opt/gb10/bin/test-ollama-vision <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+    echo "Usage: test-ollama-vision /path/to/image.jpg [model]" >&2
+    exit 1
+fi
+
+IMAGE_PATH="$1"
+MODEL="${2:-local_llama_fast}"
+
+export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+
+if base64 --help 2>&1 | grep -q -- '-w'; then
+    IMG_B64="$(base64 -w 0 "$IMAGE_PATH")"
+else
+    IMG_B64="$(base64 < "$IMAGE_PATH" | tr -d '\n')"
+fi
+
+curl -s "http://${OLLAMA_HOST}/api/chat" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"${MODEL}\",
+    \"messages\": [
+      {
+        \"role\": \"user\",
+        \"content\": \"Describe this image. Include visible text, objects, layout, and uncertainty.\",
+        \"images\": [\"${IMG_B64}\"]
+      }
+    ],
+    \"stream\": false
+  }" | jq .
+EOF
+
+    cat > /opt/gb10/bin/list-local-models <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Ollama models:"
+if command -v ollama >/dev/null 2>&1; then
+    ollama list || true
+else
+    echo "ollama not found"
+fi
+
+echo
+echo "Python default:"
+python3 --version || true
+which python3 || true
+
+echo
+echo "Python system:"
+/usr/bin/python3 --version || true
+
+echo
+echo "vLLM:"
+/usr/bin/python3 - <<'PY'
+try:
+    import vllm
+    print("vllm", getattr(vllm, "__version__", "unknown"))
+except Exception as e:
+    print("vllm import failed:", e)
+PY
+
+echo
+echo "Paths:"
+echo "HOME=$HOME"
+echo "OLLAMA_MODELS=${OLLAMA_MODELS:-unset}"
+echo "HF_HOME=${HF_HOME:-unset}"
+echo "HUGGINGFACE_HUB_CACHE=${HUGGINGFACE_HUB_CACHE:-unset}"
+echo "VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-unset}"
+echo "VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-unset}"
+echo "VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-unset}"
+echo "VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-unset}"
+EOF
+
+    chmod +x /opt/gb10/bin/*
+
+%environment
+    export PATH=/opt/gb10/bin:/usr/local/bin:/usr/bin:/bin:/opt/gb10/venv/bin:$PATH
+
+    export OLLAMA_MODELS=$HOME/models/ollama
+    export OLLAMA_HOST=127.0.0.1:11434
+
+    export HF_HOME=$HOME/models/huggingface
+    export HUGGINGFACE_HUB_CACHE=$HOME/models/huggingface/hub
+    export VLLM_CACHE_ROOT=$HOME/models/vllm
+
+    export VLLM_HOST=0.0.0.0
+    export VLLM_PORT=8000
+    export VLLM_DTYPE=bfloat16
+    export VLLM_MAX_MODEL_LEN=16384
+    export VLLM_GPU_MEMORY_UTILIZATION=0.85
+    export VLLM_ATTENTION_BACKEND=TRITON_ATTN
+
+    export NVIDIA_VISIBLE_DEVICES=all
+    export NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+%runscript
+    mkdir -p "$OLLAMA_MODELS"
+    mkdir -p "$HF_HOME"
+    mkdir -p "$HUGGINGFACE_HUB_CACHE"
+    mkdir -p "$VLLM_CACHE_ROOT"
+
+    echo "OLLAMA_MODELS=${OLLAMA_MODELS}"
+    echo "HF_HOME=${HF_HOME}"
+    echo "VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}"
+    echo "VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN}"
+    echo "VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION}"
+    echo "VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-unset}"
+
+    if [ "$#" -eq 0 ]; then
+        exec /bin/bash
+    fi
+
+    case "$1" in
+        ollama|start-ollama|pull-local-*|test-ollama*)
+            ollama serve >/tmp/ollama.log 2>&1 &
+            sleep 3
+            ;;
+    esac
+
+    exec "$@"

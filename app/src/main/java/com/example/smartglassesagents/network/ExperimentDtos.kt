@@ -10,6 +10,7 @@ data class AnalyzeImageRequest(
     val taskType: TaskType,
     val prompt: String,
     val voiceTranscript: String,
+    val selectedAgentProfile: String,
     val imageBase64: String,
     val imageMimeType: String,
     val captureSource: CaptureSource,
@@ -28,6 +29,7 @@ data class AnalyzeImageRequest(
             .put("session_id", sessionId)
             .put("task_type", taskType.wireName)
             .put("prompt", prompt)
+            .put("selected_agent_profile", selectedAgentProfile)
             .put("image_base64", imageBase64)
             .put("image_mime_type", imageMimeType)
             .put("capture_metadata", captureMetadata)
@@ -69,6 +71,25 @@ data class AnalyzeImageResponse(
                 speechText = json.optString("speech_text", "")
             )
         }
+    }
+}
+
+data class ModelProfile(
+    val agentProfile: String,
+    val modelId: String,
+    val runtime: String,
+    val status: String,
+    val purpose: String
+) {
+    companion object {
+        fun fromJson(json: JSONObject): ModelProfile =
+            ModelProfile(
+                agentProfile = json.optString("agent_profile", ""),
+                modelId = json.optString("model_id", ""),
+                runtime = json.optString("runtime", ""),
+                status = json.optString("status", ""),
+                purpose = json.optString("purpose", "")
+            )
     }
 }
 

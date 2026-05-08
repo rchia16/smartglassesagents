@@ -1,0 +1,12 @@
+# Copy the relevant values into local.properties.
+# Do not commit local.properties.
+
+# Required for realDat builds so Gradle can resolve Meta DAT artifacts from GitHub Packages.
+# Token scope: read:packages.
+github_token=ghp_replace_with_read_packages_token
+
+# Optional. Set only if GitHub Packages rejects the default username.
+github_username=your_github_username
+
+# Required for realDat builds. Create this in the Meta Wearables Developer Center.
+meta_wearables_application_id=replace_with_meta_wearables_application_id

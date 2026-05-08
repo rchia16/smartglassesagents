@@ -77,7 +77,7 @@ Goals:
 
 - Connect Android to Ray-Ban Meta AI Glasses through Meta Wearables DAT.
 - Validate real or mocked device lifecycle before model integration.
-- Current repo status: a compileable DAT-facing abstraction and mock controller are implemented; real SDK wiring still needs GitHub Packages credentials and a Meta Wearables application ID.
+- Current repo status: Android has `mockDat` and `realDat` build flavors. The mock flavor compiles without Meta credentials. The real flavor has DAT dependency wiring, manifest placeholders, permission bridge, registration/device monitoring, stream session start/stop, video frame capture, photo capture, setup preflight tooling, and hardware acceptance checks documented. Real hardware validation still requires GitHub Packages credentials and a Meta Wearables application ID.
 
 Work:
 
@@ -126,10 +126,10 @@ Work:
 
 Acceptance criteria:
 
-- One still image reaches GB10.
-- Android displays the returned result.
-- Android speaks returned `speech_text`.
-- No model/provider key exists in Android.
+- One still image reaches GB10. Current status: works with phone camera and mock DAT; real DAT path is implemented for hardware validation.
+- Android displays the returned result. Current status: implemented.
+- Android speaks returned `speech_text`. Current status: implemented.
+- No model/provider key exists in Android. Current status: maintained.
 
 ### Phase 4: Local VLM Runtime On GB10
 
@@ -169,6 +169,7 @@ Goals:
 
 - Run two agent profiles on the same image/task.
 - Display both results and speak the selected result.
+- Current repo status: the GB10 host runs the Gemma fast/detail Ollama profiles and can also run a `local_nemotron_detail` profile against a local OpenAI-compatible Nemotron server. Ollama profiles can be disabled for Nemotron-only test runs. Android still uses the same `/analyze_image` contract.
 
 Agent profiles:
 
@@ -184,6 +185,10 @@ Agent profiles:
 - `local_detail_reference`
   - model: Nemotron Nano 12B V2 VL or Qwen2.5 VL 72B if feasible
   - purpose: benchmark only
+- `local_nemotron_detail`
+  - model: configured by `NEMOTRON_MODEL`, default `nvidia/nemotron-nano-12b-v2-vl`
+  - runtime: local OpenAI-compatible Nemotron server on GB10
+  - purpose: active detail-focused benchmark for OCR, small items, and spatial layout
 
 Work:
 
@@ -308,6 +313,7 @@ Acceptance criteria:
 Goals:
 
 - Make runs reproducible and analyzable.
+- Current repo status: GB10 run records are persisted to JSONL by default, `/experiment_runs` reads the persisted records, and `/export` returns a CSV summary. Raw image storage is disabled by default and gated behind `GB10_STORE_RAW_IMAGES=1`.
 
 Store:
 
@@ -352,7 +358,7 @@ Automated tests:
 Manual hardware tests:
 
 - Ray-Ban Meta pairing and session state.
-- DAT camera/photo/video path.
+- DAT camera/photo/video path. Current next manual check: run `realDatDebug` on the phone and follow `docs/rayban-meta-dat-acceptance.md`.
 - Phone camera fallback.
 - Glasses microphone path or phone microphone fallback.
 - TTS routed to glasses audio.

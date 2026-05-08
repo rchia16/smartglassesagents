@@ -2,6 +2,7 @@ package com.example.smartglassesagents.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -40,6 +41,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -54,9 +56,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.example.smartglassesagents.BuildConfig
 import com.example.smartglassesagents.capture.toJpegBase64
 import com.example.smartglassesagents.dat.DatDeviceState
-import com.example.smartglassesagents.dat.MockDatSessionController
+import com.example.smartglassesagents.dat.DatPermissionBridge
+import com.example.smartglassesagents.dat.NoOpDatPermissionBridge
+import com.example.smartglassesagents.dat.createDatSessionController
 import com.example.smartglassesagents.experiment.CaptureSource
 import com.example.smartglassesagents.experiment.ExperimentStatus
 import com.example.smartglassesagents.experiment.HostConfig
@@ -65,6 +70,7 @@ import com.example.smartglassesagents.network.AgentResult
 import com.example.smartglassesagents.network.AnalyzeImageRequest
 import com.example.smartglassesagents.network.AnalyzeImageResponse
 import com.example.smartglassesagents.network.Gb10ApiClient
+import com.example.smartglassesagents.network.ModelProfile
 import com.example.smartglassesagents.speech.AudioRouteController
 import com.example.smartglassesagents.speech.AudioRouteState
 import com.example.smartglassesagents.speech.SpeechController
@@ -76,21 +82,40 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.UUID
 
+private const val SETTINGS_NAME = "smart_glasses_agents_settings"
+private const val SETTINGS_HOST_URL = "host_url"
+private const val SETTINGS_PAIRING_TOKEN = "pairing_token"
+private const val SETTINGS_AGENT_PROFILE = "agent_profile"
+private const val DEFAULT_HOST_URL = "http://192.168.0.243:8765"
+
 @Composable
-fun ExperimentApp() {
+fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBridge()) {
     val context = LocalContext.current
+    val settings = remember {
+        context.getSharedPreferences(SETTINGS_NAME, Context.MODE_PRIVATE)
+    }
     val coroutineScope = rememberCoroutineScope()
     val sessionId = remember { UUID.randomUUID().toString() }
     val speechController = remember { SpeechController(context) }
     val audioRouteController = remember { AudioRouteController(context) }
     val audioRouteState by audioRouteController.state.collectAsState()
-    val datController = remember { MockDatSessionController() }
+    val datController = remember {
+        createDatSessionController(context, coroutineScope, datPermissionBridge)
+    }
     val datState by datController.state.collectAsState()
     // GB10: 192.168.0.243, ARIA: 192.168.0.194, mock: http://10.0.2.2:8765
-    var hostUrl by remember { mutableStateOf("http://192.168.0.243:8765") }
-    var pairingToken by remember { mutableStateOf("") }
+    var hostUrl by remember {
+        mutableStateOf(settings.getString(SETTINGS_HOST_URL, DEFAULT_HOST_URL) ?: DEFAULT_HOST_URL)
+    }
+    var pairingToken by remember {
+        mutableStateOf(settings.getString(SETTINGS_PAIRING_TOKEN, "") ?: "")
+    }
     var selectedTask by remember { mutableStateOf(TaskType.BoardText) }
     var prompt by remember { mutableStateOf(TaskType.BoardText.defaultPrompt) }
+    var availableModels by remember { mutableStateOf<List<ModelProfile>>(emptyList()) }
+    var selectedAgentProfile by remember {
+        mutableStateOf(settings.getString(SETTINGS_AGENT_PROFILE, "") ?: "")
+    }
     var voiceTranscript by remember { mutableStateOf("") }
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var captureSource by remember { mutableStateOf(CaptureSource.PhoneCamera) }
@@ -113,6 +138,21 @@ fun ExperimentApp() {
         onDispose {
             liveSamplingJob?.cancel()
             speechController.shutdown()
+        }
+    }
+
+    LaunchedEffect(hostUrl, pairingToken) {
+        settings.edit()
+            .putString(SETTINGS_HOST_URL, hostUrl)
+            .putString(SETTINGS_PAIRING_TOKEN, pairingToken)
+            .apply()
+    }
+
+    LaunchedEffect(selectedAgentProfile) {
+        if (selectedAgentProfile.isNotBlank()) {
+            settings.edit()
+                .putString(SETTINGS_AGENT_PROFILE, selectedAgentProfile)
+                .apply()
         }
     }
 
@@ -202,6 +242,25 @@ fun ExperimentApp() {
         HostConfig(baseUrl = hostUrl, pairingToken = pairingToken)
     )
 
+    fun syncSelectedModel(models: List<ModelProfile>) {
+        availableModels = models
+        if (models.isEmpty()) {
+            selectedAgentProfile = ""
+            return
+        }
+        if (models.none { it.agentProfile == selectedAgentProfile }) {
+            selectedAgentProfile = models.first().agentProfile
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        client().getModels()
+            .onSuccess { models ->
+                syncSelectedModel(models)
+                status = ExperimentStatus.Ready("Loaded ${models.size} model profile(s).")
+            }
+    }
+
     fun speak(text: String) {
         speechController.muted = !speechEnabled
         if (speechEnabled && preferBluetoothSpeech) {
@@ -222,6 +281,7 @@ fun ExperimentApp() {
             taskType = selectedTask,
             prompt = prompt,
             voiceTranscript = voiceTranscript,
+            selectedAgentProfile = selectedAgentProfile,
             imageBase64 = bitmap.toJpegBase64(),
             imageMimeType = "image/jpeg",
             captureSource = source,
@@ -233,9 +293,9 @@ fun ExperimentApp() {
             .onSuccess { response ->
                 latestResponse = response
                 status = if (liveSample) {
-                    ExperimentStatus.Ready("Live sample ${sampleIndex ?: 0} returned ${response.results.size} result(s).")
+                    ExperimentStatus.Ready("Live sample ${sampleIndex ?: 0} returned ${response.selectedSpeechAgent}.")
                 } else {
-                    ExperimentStatus.Ready("Received ${response.results.size} agent result(s).")
+                    ExperimentStatus.Ready("Received ${response.selectedSpeechAgent}.")
                 }
                 if (speakResult) {
                     if (liveSample) {
@@ -257,7 +317,14 @@ fun ExperimentApp() {
 
     fun currentLiveFrame(): Pair<Bitmap, CaptureSource>? {
         if (datController.state.value.isReadyForCapture) {
-            datController.captureFrame()?.let { return it to CaptureSource.Mock }
+            datController.captureFrame()?.let {
+                val source = if (datController.state.value.supportsRealSdk) {
+                    CaptureSource.RayBanMetaDat
+                } else {
+                    CaptureSource.Mock
+                }
+                return it to source
+            }
         }
         val fallback = capturedBitmap ?: return null
         return fallback to captureSource
@@ -281,7 +348,7 @@ fun ExperimentApp() {
                     val frame = currentLiveFrame()
                     if (frame == null) {
                         endedWithError = true
-                        status = ExperimentStatus.Error("Start a DAT mock session or capture one still image before live sampling.")
+                        status = ExperimentStatus.Error("Start a DAT session or capture one still image before live sampling.")
                         break
                     }
 
@@ -337,38 +404,66 @@ fun ExperimentApp() {
                     status = ExperimentStatus.CheckingHost
                     coroutineScope.launch {
                         client().checkHealth()
-                            .onSuccess { status = ExperimentStatus.Ready("GB10 host is $it.") }
+                            .onSuccess {
+                                client().getModels()
+                                    .onSuccess { models ->
+                                        syncSelectedModel(models)
+                                        status = ExperimentStatus.Ready("GB10 host is $it. Loaded ${models.size} model profile(s).")
+                                    }
+                                    .onFailure { error ->
+                                        status = ExperimentStatus.Error(error.message ?: "Model list failed.")
+                                    }
+                            }
                             .onFailure { status = ExperimentStatus.Error(it.message ?: "Host check failed.") }
+                    }
+                }
+            )
+
+            ModelSelectionPanel(
+                availableModels = availableModels,
+                selectedAgentProfile = selectedAgentProfile,
+                onSelectedAgentProfileChanged = { selectedAgentProfile = it },
+                onRefresh = {
+                    coroutineScope.launch {
+                        client().getModels()
+                            .onSuccess { models ->
+                                syncSelectedModel(models)
+                                status = ExperimentStatus.Ready("Loaded ${models.size} model profile(s).")
+                            }
+                            .onFailure { error ->
+                                status = ExperimentStatus.Error(error.message ?: "Model list failed.")
+                            }
                     }
                 }
             )
 
             DatPanel(
                 datState = datState,
+                datMode = BuildConfig.DAT_MODE,
                 onRegister = {
                     datController.startRegistration()
-                    status = ExperimentStatus.Ready("DAT mock app registration is ready.")
+                    status = ExperimentStatus.Ready("DAT registration requested.")
                 },
                 onUnregister = {
                     datController.unregister()
-                    status = ExperimentStatus.Ready("DAT mock state reset.")
+                    status = ExperimentStatus.Ready("DAT state reset.")
                 },
                 onDiscoverMock = {
                     datController.discoverMockDevice()
-                    status = ExperimentStatus.Ready("Mock Ray-Ban Meta device discovered.")
+                    status = ExperimentStatus.Ready("DAT device discovery requested.")
                 },
                 onGrantCamera = {
                     datController.requestCameraPermission()
-                    status = ExperimentStatus.Ready("DAT camera permission marked granted in mock adapter.")
+                    status = ExperimentStatus.Ready("DAT camera permission requested.")
                 },
                 onStartSession = {
                     datController.startSession()
                     status = datController.state.value.recentError?.let { ExperimentStatus.Error(it) }
-                        ?: ExperimentStatus.Ready("DAT mock session is running.")
+                        ?: ExperimentStatus.Ready("DAT session start requested.")
                 },
                 onStopSession = {
                     datController.stopSession()
-                    status = ExperimentStatus.Ready("DAT mock session stopped.")
+                    status = ExperimentStatus.Ready("DAT session stopped.")
                 }
             )
 
@@ -407,12 +502,16 @@ fun ExperimentApp() {
                     val bitmap = datController.captureFrame()
                     if (bitmap == null) {
                         status = datController.state.value.recentError?.let { ExperimentStatus.Error(it) }
-                            ?: ExperimentStatus.Error("DAT mock capture failed.")
+                            ?: ExperimentStatus.Error("DAT capture failed.")
                     } else {
                         capturedBitmap = bitmap
-                        captureSource = CaptureSource.Mock
+                        captureSource = if (datController.state.value.supportsRealSdk) {
+                            CaptureSource.RayBanMetaDat
+                        } else {
+                            CaptureSource.Mock
+                        }
                         latestResponse = null
-                        status = ExperimentStatus.Ready("Image captured from DAT mock session.")
+                        status = ExperimentStatus.Ready("Image captured from DAT session.")
                     }
                 },
                 onCapturePhoneImage = {
@@ -431,6 +530,10 @@ fun ExperimentApp() {
                     val bitmap = capturedBitmap
                     if (bitmap == null) {
                         status = ExperimentStatus.Error("Capture an image before sending.")
+                        return@CapturePanel
+                    }
+                    if (selectedAgentProfile.isBlank()) {
+                        status = ExperimentStatus.Error("Load and select one model profile before sending.")
                         return@CapturePanel
                     }
                     status = ExperimentStatus.SendingImage
@@ -529,7 +632,7 @@ private fun LiveSamplingPanel(
 ) {
     Section(title = "Sampled live mode") {
         Text(
-            text = "Samples DAT mock frames when a mock session is running; otherwise resends the latest captured still. Only one request is in flight at a time.",
+            text = "Samples DAT frames when a session is running; otherwise resends the latest captured still. Only one request is in flight at a time.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -613,6 +716,7 @@ private fun VoiceQueryPanel(
 @OptIn(ExperimentalLayoutApi::class)
 private fun DatPanel(
     datState: DatDeviceState,
+    datMode: String,
     onRegister: () -> Unit,
     onUnregister: () -> Unit,
     onDiscoverMock: () -> Unit,
@@ -622,7 +726,7 @@ private fun DatPanel(
 ) {
     Section(title = "Ray-Ban Meta DAT") {
         Text(
-            text = "Adapter: ${datState.adapterName}. Real SDK wiring is gated on GitHub Packages credentials and a Meta Wearables application ID.",
+            text = "Adapter: ${datState.adapterName}. Build: $datMode.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -692,6 +796,56 @@ private fun ConnectionPanel(
 
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
+private fun ModelSelectionPanel(
+    availableModels: List<ModelProfile>,
+    selectedAgentProfile: String,
+    onSelectedAgentProfileChanged: (String) -> Unit,
+    onRefresh: () -> Unit
+) {
+    Section(title = "Inference model") {
+        Text(
+            text = "Exactly one GB10 model profile runs for each request.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (availableModels.isEmpty()) {
+            Text(
+                text = "No model profiles loaded yet.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                availableModels.forEach { model ->
+                    FilterChip(
+                        selected = selectedAgentProfile == model.agentProfile,
+                        onClick = { onSelectedAgentProfileChanged(model.agentProfile) },
+                        label = { Text(model.agentProfile) }
+                    )
+                }
+            }
+            availableModels.firstOrNull { it.agentProfile == selectedAgentProfile }?.let { model ->
+                Text(
+                    text = "${model.modelId} / ${model.runtime} / ${model.status}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (model.purpose.isNotBlank()) {
+                    Text(
+                        text = model.purpose,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+        TextButton(onClick = onRefresh) {
+            Text("Refresh models")
+        }
+    }
+}
+
+@Composable
+@OptIn(ExperimentalLayoutApi::class)
 private fun TaskPanel(
     selectedTask: TaskType,
     prompt: String,
@@ -729,7 +883,7 @@ private fun CapturePanel(
 ) {
     Section(title = "Capture") {
         Text(
-            text = "Use the DAT mock frame to exercise the glasses capture path now, or the phone camera fallback for real images.",
+            text = "Use the DAT capture path when a session is running, or the phone camera fallback for real images.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -743,7 +897,7 @@ private fun CapturePanel(
                 AssistChip(
                     onClick = onCaptureDatImage,
                     enabled = datCaptureEnabled,
-                    label = { Text("Capture DAT mock") }
+                    label = { Text("Capture DAT") }
                 )
                 AssistChip(
                     onClick = onCapturePhoneImage,
@@ -761,7 +915,7 @@ private fun CapturePanel(
             )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(onClick = onCaptureDatImage, enabled = datCaptureEnabled) {
-                    Text("DAT mock")
+                    Text("DAT")
                 }
                 Button(onClick = onCapturePhoneImage) {
                     Text("Phone")
@@ -875,6 +1029,11 @@ private fun ResultPanel(response: AnalyzeImageResponse?) {
         Text(
             text = "Run ${response.runId}",
             style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = "Selected model: ${response.selectedSpeechAgent}",
+            style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Text(text = response.speechText, style = MaterialTheme.typography.bodyLarge)
