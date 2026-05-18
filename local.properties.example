@@ -10,3 +10,6 @@ github_username=your_github_username
 
 # Required for realDat builds. Create this in the Meta Wearables Developer Center.
 meta_wearables_application_id=replace_with_meta_wearables_application_id
+
+# Required for realDat builds when the Developer Center app provides a client token.
+meta_wearables_client_token=replace_with_meta_wearables_client_token

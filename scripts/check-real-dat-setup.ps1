@@ -23,6 +23,8 @@ $hasGithubToken = -not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN) -or
     ($values.ContainsKey("github_token") -and -not [string]::IsNullOrWhiteSpace($values["github_token"]))
 $hasMetaAppId = -not [string]::IsNullOrWhiteSpace($env:META_WEARABLES_APPLICATION_ID) -or
     ($values.ContainsKey("meta_wearables_application_id") -and -not [string]::IsNullOrWhiteSpace($values["meta_wearables_application_id"]) -and $values["meta_wearables_application_id"] -ne "0")
+$hasMetaClientToken = -not [string]::IsNullOrWhiteSpace($env:META_WEARABLES_CLIENT_TOKEN) -or
+    ($values.ContainsKey("meta_wearables_client_token") -and -not [string]::IsNullOrWhiteSpace($values["meta_wearables_client_token"]))
 $hasGithubUsername = -not [string]::IsNullOrWhiteSpace($env:GITHUB_ACTOR) -or
     ($values.ContainsKey("github_username") -and -not [string]::IsNullOrWhiteSpace($values["github_username"]))
 
@@ -30,8 +32,9 @@ Write-Host "Real DAT setup preflight"
 Write-Host "GITHUB_TOKEN/github_token:          $(if ($hasGithubToken) { 'present' } else { 'missing' })"
 Write-Host "GITHUB_ACTOR/github_username:      $(if ($hasGithubUsername) { 'present' } else { 'default username will be used' })"
 Write-Host "META_WEARABLES_APPLICATION_ID/id:  $(if ($hasMetaAppId) { 'present' } else { 'missing' })"
+Write-Host "META_WEARABLES_CLIENT_TOKEN/token: $(if ($hasMetaClientToken) { 'present' } else { 'missing' })"
 
-if (-not $hasGithubToken -or -not $hasMetaAppId) {
+if (-not $hasGithubToken -or -not $hasMetaAppId -or -not $hasMetaClientToken) {
     Write-Error "Real DAT setup is incomplete. Copy local.properties.example to local.properties and fill the missing values."
 }
 

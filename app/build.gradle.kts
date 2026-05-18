@@ -16,6 +16,10 @@ val metaWearablesApplicationId =
     System.getenv("META_WEARABLES_APPLICATION_ID")
         ?: localProperties.getProperty("meta_wearables_application_id")
         ?: "0"
+val metaWearablesClientToken =
+    System.getenv("META_WEARABLES_CLIENT_TOKEN")
+        ?: localProperties.getProperty("meta_wearables_client_token")
+        ?: ""
 val githubPackagesToken =
     System.getenv("GITHUB_TOKEN")
         ?: localProperties.getProperty("github_token")
@@ -36,6 +40,7 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders["metaWearablesApplicationId"] = metaWearablesApplicationId
+        manifestPlaceholders["metaWearablesClientToken"] = metaWearablesClientToken
     }
 
     flavorDimensions += "dat"
@@ -43,10 +48,12 @@ android {
         create("mockDat") {
             dimension = "dat"
             buildConfigField("String", "DAT_MODE", "\"mock\"")
+            minSdk = 24
         }
         create("realDat") {
             dimension = "dat"
             buildConfigField("String", "DAT_MODE", "\"real\"")
+            minSdk = 29
         }
     }
 
@@ -79,6 +86,9 @@ gradle.taskGraph.whenReady {
             if (githubPackagesToken.isBlank()) add("GITHUB_TOKEN or local.properties github_token")
             if (metaWearablesApplicationId == "0" || metaWearablesApplicationId.isBlank()) {
                 add("META_WEARABLES_APPLICATION_ID or local.properties meta_wearables_application_id")
+            }
+            if (metaWearablesClientToken.isBlank()) {
+                add("META_WEARABLES_CLIENT_TOKEN or local.properties meta_wearables_client_token")
             }
         }
         if (missing.isNotEmpty()) {

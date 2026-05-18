@@ -25,9 +25,8 @@ fun createDatSessionController(
             CoroutineScope::class.java,
             DatPermissionBridge::class.java,
         )
-        constructor.newInstance(context.applicationContext, coroutineScope, permissionBridge) as DatSessionController
+        constructor.newInstance(context, coroutineScope, permissionBridge) as DatSessionController
     }.getOrElse {
         MockDatSessionController()
     }
 }
-

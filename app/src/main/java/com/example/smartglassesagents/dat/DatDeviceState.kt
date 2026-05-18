@@ -7,6 +7,10 @@ data class DatDeviceState(
     val activeDeviceId: String? = null,
     val cameraPermissionStatus: DatPermissionStatus = DatPermissionStatus.Unknown,
     val sessionStatus: DatSessionStatus = DatSessionStatus.Stopped,
+    val deviceCount: Int = devices.size,
+    val deviceSessionState: String = "Unknown",
+    val streamState: String = "Unknown",
+    val streamError: String? = null,
     val supportsRealSdk: Boolean = false,
     val recentError: String? = null
 ) {

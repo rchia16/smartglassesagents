@@ -1,5 +1,6 @@
 package com.example.smartglassesagents.dat
 
+import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -8,14 +9,16 @@ import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
 import androidx.exifinterface.media.ExifInterface
-import com.meta.wearable.dat.camera.StreamSession
-import com.meta.wearable.dat.camera.startStreamSession
+import com.meta.wearable.dat.camera.Stream
+import com.meta.wearable.dat.camera.addStream
 import com.meta.wearable.dat.camera.types.PhotoData
 import com.meta.wearable.dat.camera.types.StreamConfiguration
+import com.meta.wearable.dat.camera.types.StreamState
 import com.meta.wearable.dat.camera.types.VideoFrame
 import com.meta.wearable.dat.camera.types.VideoQuality
 import com.meta.wearable.dat.core.Wearables
-import com.meta.wearable.dat.core.selectors.AutoDeviceSelector
+import com.meta.wearable.dat.core.selectors.DeviceSelector
+import com.meta.wearable.dat.core.session.DeviceSession
 import com.meta.wearable.dat.core.types.DeviceCompatibility
 import com.meta.wearable.dat.core.types.DeviceIdentifier
 import com.meta.wearable.dat.core.types.Permission
@@ -25,8 +28,10 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -43,14 +48,23 @@ class RealDatSessionController(
     )
     override val state: StateFlow<DatDeviceState> = _state
 
-    private val deviceSelector = AutoDeviceSelector()
+    private val selectedDeviceFlow = MutableStateFlow<DeviceIdentifier?>(null)
+    private val deviceSelector = object : DeviceSelector {
+        override fun activeDevice(): DeviceIdentifier? = activeDevice
+        override fun activeDeviceFlow(): Flow<DeviceIdentifier?> =
+            selectedDeviceFlow.asStateFlow()
+    }
     private var monitoringStarted = false
     private var activeDevice: DeviceIdentifier? = null
-    private var streamSession: StreamSession? = null
+    private var coreSession: DeviceSession? = null
+    private var stream: Stream? = null
     private var latestFrame: Bitmap? = null
     private var registrationJob: Job? = null
     private var deviceJob: Job? = null
-    private var activeDeviceJob: Job? = null
+    private var deviceSessionJob: Job? = null
+    private var sessionErrorJob: Job? = null
+    private var streamErrorJob: Job? = null
+    private var stateJob: Job? = null
     private var videoJob: Job? = null
 
     override fun startMonitoring() {
@@ -74,30 +88,39 @@ class RealDatSessionController(
         }
         deviceJob = coroutineScope.launch {
             Wearables.devices.collect { devices ->
+                val selectedDevice = activeDevice?.takeIf { it in devices } ?: devices.firstOrNull()
+                activeDevice = selectedDevice
+                selectedDeviceFlow.value = selectedDevice
                 _state.update {
                     it.copy(
                         devices = devices.map { device -> device.toDatDevice() },
+                        deviceCount = devices.size,
+                        activeDeviceId = selectedDevice?.toString(),
                         recentError = null,
                     )
                 }
             }
         }
-        activeDeviceJob = coroutineScope.launch {
-            deviceSelector.activeDevice(Wearables.devices).collect { device ->
-                activeDevice = device
-                _state.update { it.copy(activeDeviceId = device?.toString(), recentError = null) }
-            }
-        }
     }
 
     override fun startRegistration() {
-        runCatching { Wearables.startRegistration(context) }
+        val activity = context as? Activity
+        if (activity == null) {
+            setError("DAT registration requires an Activity context.")
+            return
+        }
+        runCatching { Wearables.startRegistration(activity) }
             .onFailure { error -> setError("DAT registration failed: ${error.message ?: error::class.java.simpleName}") }
     }
 
     override fun unregister() {
         stopSession()
-        runCatching { Wearables.startUnregistration(context) }
+        val activity = context as? Activity
+        if (activity == null) {
+            setError("DAT unregistration requires an Activity context.")
+            return
+        }
+        runCatching { Wearables.startUnregistration(activity) }
             .onFailure { error -> setError("DAT unregistration failed: ${error.message ?: error::class.java.simpleName}") }
     }
 
@@ -145,51 +168,137 @@ class RealDatSessionController(
     }
 
     override fun stopSession() {
+        streamErrorJob?.cancel()
+        streamErrorJob = null
+        sessionErrorJob?.cancel()
+        sessionErrorJob = null
+        deviceSessionJob?.cancel()
+        deviceSessionJob = null
+        stateJob?.cancel()
+        stateJob = null
         videoJob?.cancel()
         videoJob = null
-        runCatching { streamSession?.close() }
-        streamSession = null
+        runCatching { coreSession?.stop() }
+        coreSession = null
+        stream = null
         latestFrame = null
-        _state.update { it.copy(sessionStatus = DatSessionStatus.Stopped, recentError = null) }
+        _state.update {
+            it.copy(
+                sessionStatus = DatSessionStatus.Stopped,
+                deviceSessionState = "Stopped",
+                streamState = "Stopped",
+                streamError = null,
+                recentError = null,
+            )
+        }
     }
 
     override fun captureFrame(): Bitmap? {
-        val session = streamSession
-        if (session == null || _state.value.sessionStatus != DatSessionStatus.Running) {
+        val currentStream = stream
+        if (currentStream == null || _state.value.sessionStatus != DatSessionStatus.Running) {
             setError("Start a DAT stream session before capturing a frame.")
+            return latestFrame
+        }
+        if (currentStream.state.value != StreamState.STREAMING) {
+            setError("DAT stream is ${currentStream.state.value}; wait until it is streaming before capturing.")
             return latestFrame
         }
 
         coroutineScope.launch {
-            session.capturePhoto()
+            currentStream.capturePhoto()
                 .onSuccess { photoData ->
                     latestFrame = photoData.toBitmap()
                 }
-                .onFailure {
-                    setError("DAT photo capture failed.")
+                .onFailure { error ->
+                    val detail = error.message ?: error::class.java.simpleName
+                    setError("DAT photo capture failed: $detail. Using latest stream frame if available.")
                 }
         }
         return latestFrame
     }
 
     private fun startStreamSession() {
-        val session = runCatching {
-            Wearables.startStreamSession(
-                context,
-                deviceSelector,
+        coroutineScope.launch {
+            val sessionResult = Wearables.createSession(deviceSelector)
+            val session = sessionResult.getOrNull()
+            if (session == null) {
+                setError("DAT session creation failed: ${sessionResult.failureDescription()}.")
+                return@launch
+            }
+
+            sessionErrorJob?.cancel()
+            sessionErrorJob = coroutineScope.launch {
+                session.errors.collect { error ->
+                    setError("DAT session error: ${error.descriptionOrType()}")
+                }
+            }
+
+            val streamResult = session.addStream(
                 StreamConfiguration(videoQuality = VideoQuality.MEDIUM, 24),
             )
-        }.getOrElse { error ->
-            setError("DAT stream session failed: ${error.message ?: error::class.java.simpleName}")
-            return
-        }
+            val createdStream = streamResult.getOrNull()
+            if (createdStream == null) {
+                setError("DAT stream creation failed: ${streamResult.failureDescription()}.")
+                session.stop()
+                return@launch
+            }
+            coreSession = session
+            stream = createdStream
+            _state.update { it.copy(sessionStatus = DatSessionStatus.Paused, recentError = "DAT stream is starting.") }
 
-        streamSession = session
-        _state.update { it.copy(sessionStatus = DatSessionStatus.Running, recentError = null) }
-        videoJob?.cancel()
-        videoJob = coroutineScope.launch {
-            session.videoStream.collect { frame ->
-                latestFrame = frame.toBitmap()
+            deviceSessionJob?.cancel()
+            deviceSessionJob = coroutineScope.launch {
+                session.state.collect { deviceState ->
+                    _state.update { it.copy(deviceSessionState = deviceState.name) }
+                }
+            }
+            stateJob?.cancel()
+            stateJob = coroutineScope.launch {
+                createdStream.state.collect { streamState ->
+                    _state.update {
+                        when (streamState) {
+                            StreamState.STREAMING -> it.copy(
+                                sessionStatus = DatSessionStatus.Running,
+                                streamState = streamState.name,
+                                recentError = null,
+                            )
+                            StreamState.STOPPED,
+                            StreamState.CLOSED -> it.copy(
+                                sessionStatus = DatSessionStatus.Stopped,
+                                streamState = streamState.name,
+                                recentError = null,
+                            )
+                            else -> it.copy(
+                                sessionStatus = DatSessionStatus.Paused,
+                                streamState = streamState.name,
+                                recentError = "DAT stream is $streamState.",
+                            )
+                        }
+                    }
+                }
+            }
+            streamErrorJob?.cancel()
+            streamErrorJob = coroutineScope.launch {
+                createdStream.errorStream.collect { error ->
+                    _state.update {
+                        it.copy(
+                            sessionStatus = DatSessionStatus.Error,
+                            streamError = error.descriptionOrType(),
+                            recentError = "DAT stream error: ${error.descriptionOrType()}",
+                        )
+                    }
+                }
+            }
+            videoJob?.cancel()
+            videoJob = coroutineScope.launch {
+                createdStream.videoStream.collect { frame: VideoFrame ->
+                    latestFrame = frame.toBitmap()
+                }
+            }
+
+            val startResult = createdStream.start()
+            startResult.onFailure { error ->
+                setError("DAT stream start failed: ${error.message ?: error::class.java.simpleName}")
             }
         }
     }
@@ -206,6 +315,21 @@ class RealDatSessionController(
     private fun setError(message: String) {
         _state.update { it.copy(sessionStatus = DatSessionStatus.Error, recentError = message) }
     }
+
+    private fun Any?.descriptionOrType(): String =
+        when (this) {
+            null -> "Unknown"
+            else -> runCatching {
+                val description = this::class.java.getMethod("getDescription").invoke(this) as? String
+                description?.ifBlank { null } ?: this::class.java.simpleName
+            }.getOrDefault(this::class.java.simpleName)
+        }
+
+    private fun Any?.failureDescription(): String =
+        runCatching {
+            val failure = this?.javaClass?.getMethod("failureOrNull")?.invoke(this)
+            failure.descriptionOrType()
+        }.getOrDefault("Unknown")
 
     private fun DeviceIdentifier.toDatDevice(): DatDevice {
         val metadata = Wearables.devicesMetadata[this]?.value
@@ -225,9 +349,9 @@ class RealDatSessionController(
 
     private fun RegistrationState.toDatRegistrationStatus(): DatRegistrationStatus =
         when (this) {
-            is RegistrationState.Registered -> DatRegistrationStatus.Registered
-            is RegistrationState.Registering -> DatRegistrationStatus.Registering
-            is RegistrationState.Unavailable -> DatRegistrationStatus.Unavailable
+            RegistrationState.REGISTERED -> DatRegistrationStatus.Registered
+            RegistrationState.REGISTERING -> DatRegistrationStatus.Registering
+            RegistrationState.UNAVAILABLE -> DatRegistrationStatus.Unavailable
             else -> DatRegistrationStatus.NotRegistered
         }
 

@@ -32,6 +32,12 @@
             android:name="com.meta.wearable.mwdat.APPLICATION_ID"
             android:value="${metaWearablesApplicationId}" />
         <meta-data
+            android:name="com.meta.wearable.mwdat.CLIENT_TOKEN"
+            android:value="${metaWearablesClientToken}" />
+        <meta-data
+            android:name="com.meta.wearable.mwdat.DAM_ENABLED"
+            android:value="true" />
+        <meta-data
             android:name="com.meta.wearable.mwdat.ANALYTICS_OPT_OUT"
             android:value="true" />
 

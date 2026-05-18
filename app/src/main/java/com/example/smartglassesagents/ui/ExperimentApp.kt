@@ -129,10 +129,10 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
     var liveSpeakResults by remember { mutableStateOf(false) }
     var liveSampleCount by remember { mutableStateOf(0) }
     var lastSpokenLiveText by remember { mutableStateOf("") }
+    var datMonitoringStarted by remember { mutableStateOf(false) }
     val isLiveSampling = liveSamplingJob?.isActive == true
 
     DisposableEffect(Unit) {
-        datController.startMonitoring()
         audioRouteController.refresh()
         audioRouteController.clearPreferredOutput()
         onDispose {
@@ -232,9 +232,25 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
     ) { granted ->
         audioRouteController.refresh()
         status = if (granted) {
+            if (!datMonitoringStarted) {
+                datController.startMonitoring()
+                datMonitoringStarted = true
+            }
             ExperimentStatus.Ready("Bluetooth audio permission granted.")
         } else {
             ExperimentStatus.Error("Bluetooth Connect permission is required to inspect glasses audio routes.")
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        val needsBluetoothPermission =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+        if (needsBluetoothPermission) {
+            bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+        } else if (!datMonitoringStarted) {
+            datController.startMonitoring()
+            datMonitoringStarted = true
         }
     }
 
@@ -733,7 +749,13 @@ private fun DatPanel(
         Text(text = "Registration: ${datState.registrationStatus.label}")
         Text(text = "Camera permission: ${datState.cameraPermissionStatus.label}")
         Text(text = "Session: ${datState.sessionStatus.label}")
+        Text(text = "Devices: ${datState.deviceCount}")
         Text(text = "Active device: ${datState.activeDevice?.name ?: "None"}")
+        Text(text = "Device session: ${datState.deviceSessionState}")
+        Text(text = "Stream: ${datState.streamState}")
+        datState.streamError?.let { error ->
+            Text(text = "Stream error: $error", color = MaterialTheme.colorScheme.error)
+        }
         datState.recentError?.let { error ->
             Text(text = error, color = MaterialTheme.colorScheme.error)
         }
