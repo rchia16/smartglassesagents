@@ -19,7 +19,9 @@ import com.meta.wearable.dat.camera.types.VideoQuality
 import com.meta.wearable.dat.core.Wearables
 import com.meta.wearable.dat.core.selectors.DeviceSelector
 import com.meta.wearable.dat.core.session.DeviceSession
+import com.meta.wearable.dat.core.session.DeviceSessionState
 import com.meta.wearable.dat.core.types.DeviceCompatibility
+import com.meta.wearable.dat.core.types.DeviceSessionError
 import com.meta.wearable.dat.core.types.DeviceIdentifier
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
@@ -27,13 +29,16 @@ import com.meta.wearable.dat.core.types.RegistrationState
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 class RealDatSessionController(
     private val context: Context,
@@ -66,6 +71,7 @@ class RealDatSessionController(
     private var streamErrorJob: Job? = null
     private var stateJob: Job? = null
     private var videoJob: Job? = null
+    private var terminalStartupError: String? = null
 
     override fun startMonitoring() {
         if (monitoringStarted) return
@@ -152,13 +158,19 @@ class RealDatSessionController(
     }
 
     override fun startSession() {
+        terminalStartupError = null
         val current = _state.value
+        val device = activeDevice
+
         when {
             current.registrationStatus != DatRegistrationStatus.Registered -> {
                 setError("Register the app with Meta Wearables DAT before starting a session.")
             }
-            activeDevice == null -> {
+            device == null -> {
                 setError("Pair and connect Ray-Ban Meta glasses before starting a DAT session.")
+            }
+            activeDeviceRequiresUpdate() -> {
+                setError("Ray-Ban Meta glasses need a firmware update before DAT camera can start.")
             }
             current.cameraPermissionStatus != DatPermissionStatus.Granted -> {
                 setError("Grant DAT camera permission before starting a session.")
@@ -182,6 +194,7 @@ class RealDatSessionController(
         coreSession = null
         stream = null
         latestFrame = null
+        terminalStartupError = null
         _state.update {
             it.copy(
                 sessionStatus = DatSessionStatus.Stopped,
@@ -191,6 +204,26 @@ class RealDatSessionController(
                 recentError = null,
             )
         }
+    }
+
+    private fun stopSessionForRestart() {
+        streamErrorJob?.cancel()
+        streamErrorJob = null
+        sessionErrorJob?.cancel()
+        sessionErrorJob = null
+        deviceSessionJob?.cancel()
+        deviceSessionJob = null
+        stateJob?.cancel()
+        stateJob = null
+        videoJob?.cancel()
+        videoJob = null
+
+        runCatching { stream?.stop() }
+        runCatching { coreSession?.stop() }
+
+        stream = null
+        coreSession = null
+        latestFrame = null
     }
 
     override fun captureFrame(): Bitmap? {
@@ -219,6 +252,17 @@ class RealDatSessionController(
 
     private fun startStreamSession() {
         coroutineScope.launch {
+            stopSessionForRestart()
+            terminalStartupError = null
+
+            _state.update {
+                it.copy(
+                    sessionStatus = DatSessionStatus.Paused,
+                    recentError = "Creating DAT device session.",
+                    streamError = null,
+                )
+            }
+
             val sessionResult = Wearables.createSession(deviceSelector)
             val session = sessionResult.getOrNull()
             if (session == null) {
@@ -226,25 +270,27 @@ class RealDatSessionController(
                 return@launch
             }
 
+            coreSession = session
+
+            val startupFailure = CompletableDeferred<StartupFailure>()
+
             sessionErrorJob?.cancel()
             sessionErrorJob = coroutineScope.launch {
                 session.errors.collect { error ->
-                    setError("DAT session error: ${error.descriptionOrType()}")
+                    if (error == DeviceSessionError.SESSION_ENDED_BY_DEVICE && terminalStartupError != null) {
+                        return@collect
+                    }
+
+                    val failure = error.toStartupFailure()
+                    if (failure.isTerminal) {
+                        terminalStartupError = failure.message
+                    }
+                    if (!startupFailure.isCompleted) {
+                        startupFailure.complete(failure)
+                    }
+                    setError(failure.message)
                 }
             }
-
-            val streamResult = session.addStream(
-                StreamConfiguration(videoQuality = VideoQuality.MEDIUM, 24),
-            )
-            val createdStream = streamResult.getOrNull()
-            if (createdStream == null) {
-                setError("DAT stream creation failed: ${streamResult.failureDescription()}.")
-                session.stop()
-                return@launch
-            }
-            coreSession = session
-            stream = createdStream
-            _state.update { it.copy(sessionStatus = DatSessionStatus.Paused, recentError = "DAT stream is starting.") }
 
             deviceSessionJob?.cancel()
             deviceSessionJob = coroutineScope.launch {
@@ -252,6 +298,65 @@ class RealDatSessionController(
                     _state.update { it.copy(deviceSessionState = deviceState.name) }
                 }
             }
+
+            _state.update {
+                it.copy(
+                    sessionStatus = DatSessionStatus.Paused,
+                    recentError = "Starting DAT device session.",
+                )
+            }
+
+            try {
+                session.start()
+            } catch (error: Throwable) {
+                setError("DAT device session start failed: ${error.message ?: error::class.java.simpleName}.")
+                cleanupFailedStart(session)
+                return@launch
+            }
+
+            val startedState = withTimeoutOrNull(15_000) {
+                while (true) {
+                    if (startupFailure.isCompleted) return@withTimeoutOrNull false
+
+                    when (session.state.value) {
+                        DeviceSessionState.STARTED,
+                        DeviceSessionState.PAUSED -> return@withTimeoutOrNull true
+
+                        DeviceSessionState.STOPPED -> return@withTimeoutOrNull false
+                        else -> delay(100)
+                    }
+                }
+            }
+            if (startedState != true) {
+                val startupError = if (startupFailure.isCompleted) {
+                    startupFailure.await().message
+                } else {
+                    null
+                }
+                setError(startupError ?: "DAT device session did not reach STARTED after start.")
+                cleanupFailedStart(session)
+                return@launch
+            }
+
+            _state.update {
+                it.copy(
+                    sessionStatus = DatSessionStatus.Paused,
+                    recentError = "Adding DAT camera stream.",
+                )
+            }
+
+            val streamResult = session.addStream(
+                StreamConfiguration(videoQuality = VideoQuality.LOW, 15),
+            )
+
+            val createdStream = streamResult.getOrNull()
+            if (createdStream == null) {
+                setError("DAT stream creation failed: ${streamResult.failureDescription()}.")
+                cleanupFailedStart(session)
+                return@launch
+            }
+            stream = createdStream
+
             stateJob?.cancel()
             stateJob = coroutineScope.launch {
                 createdStream.state.collect { streamState ->
@@ -262,12 +367,14 @@ class RealDatSessionController(
                                 streamState = streamState.name,
                                 recentError = null,
                             )
+
                             StreamState.STOPPED,
                             StreamState.CLOSED -> it.copy(
                                 sessionStatus = DatSessionStatus.Stopped,
                                 streamState = streamState.name,
                                 recentError = null,
                             )
+
                             else -> it.copy(
                                 sessionStatus = DatSessionStatus.Paused,
                                 streamState = streamState.name,
@@ -277,6 +384,7 @@ class RealDatSessionController(
                     }
                 }
             }
+
             streamErrorJob?.cancel()
             streamErrorJob = coroutineScope.launch {
                 createdStream.errorStream.collect { error ->
@@ -289,6 +397,7 @@ class RealDatSessionController(
                     }
                 }
             }
+
             videoJob?.cancel()
             videoJob = coroutineScope.launch {
                 createdStream.videoStream.collect { frame: VideoFrame ->
@@ -296,11 +405,39 @@ class RealDatSessionController(
                 }
             }
 
-            val startResult = createdStream.start()
-            startResult.onFailure { error ->
-                setError("DAT stream start failed: ${error.message ?: error::class.java.simpleName}")
+            _state.update {
+                it.copy(
+                    sessionStatus = DatSessionStatus.Paused,
+                    recentError = "Starting DAT camera stream.",
+                )
+            }
+
+            val streamStartResult = createdStream.start()
+            if (streamStartResult.getOrNull() == null) {
+                setError("DAT stream start failed: ${streamStartResult.failureDescription()}.")
+                stream = null
+                cleanupFailedStart(session)
+                return@launch
             }
         }
+    }
+
+    private fun cleanupFailedStart(session: DeviceSession) {
+        streamErrorJob?.cancel()
+        streamErrorJob = null
+        stateJob?.cancel()
+        stateJob = null
+        videoJob?.cancel()
+        videoJob = null
+        deviceSessionJob?.cancel()
+        deviceSessionJob = null
+        sessionErrorJob?.cancel()
+        sessionErrorJob = null
+        runCatching { stream?.stop() }
+        runCatching { session.stop() }
+        stream = null
+        coreSession = null
+        latestFrame = null
     }
 
     private suspend fun checkCameraPermission(): DatPermissionStatus {
@@ -316,20 +453,58 @@ class RealDatSessionController(
         _state.update { it.copy(sessionStatus = DatSessionStatus.Error, recentError = message) }
     }
 
+    private fun DeviceSessionError.toStartupFailure(): StartupFailure =
+        StartupFailure(
+            message = when (this) {
+                DeviceSessionError.DAT_APP_ON_THE_GLASSES_UPDATE_REQUIRED ->
+                    "DAT cannot start because the app on the glasses must be updated. Update the glasses and Meta AI app, then reconnect."
+
+                DeviceSessionError.SESSION_ENDED_BY_DEVICE ->
+                    "DAT session ended by the glasses before camera streaming could start."
+
+                DeviceSessionError.NO_ELIGIBLE_DEVICE ->
+                    "DAT cannot start because no eligible glasses are available."
+
+                DeviceSessionError.DEVICE_DISCONNECTED ->
+                    "DAT cannot start because the glasses disconnected."
+
+                DeviceSessionError.DEVICE_POWERED_OFF ->
+                    "DAT cannot start because the glasses are powered off."
+
+                else -> "DAT session error: ${descriptionOrType()}"
+            },
+            isTerminal = this != DeviceSessionError.SESSION_ENDED_BY_DEVICE,
+        )
+
     private fun Any?.descriptionOrType(): String =
         when (this) {
             null -> "Unknown"
             else -> runCatching {
-                val description = this::class.java.getMethod("getDescription").invoke(this) as? String
-                description?.ifBlank { null } ?: this::class.java.simpleName
-            }.getOrDefault(this::class.java.simpleName)
+                val description = this::class.java.methods
+                    .firstOrNull { it.name == "getDescription" && it.parameterCount == 0 }
+                    ?.invoke(this) as? String
+
+                description?.ifBlank { null }
+                    ?: "${this::class.java.name}: $this"
+            }.getOrDefault("${this::class.java.name}: $this")
         }
 
-    private fun Any?.failureDescription(): String =
-        runCatching {
-            val failure = this?.javaClass?.getMethod("failureOrNull")?.invoke(this)
-            failure.descriptionOrType()
-        }.getOrDefault("Unknown")
+    private fun Any?.failureDescription(): String {
+        if (this == null) return "Result object was null"
+
+        return runCatching {
+            val failure = this::class.java.methods
+                .firstOrNull { it.name == "failureOrNull" && it.parameterCount == 0 }
+                ?.invoke(this)
+
+            when (failure) {
+                null -> "No failure object. result=${this::class.java.name}: $this"
+                else -> failure.descriptionOrType()
+            }
+        }.getOrElse { reflectionError ->
+            "Could not inspect failure. result=${this::class.java.name}: $this; inspectionError=${reflectionError.message}"
+        }
+    }
 
     private fun DeviceIdentifier.toDatDevice(): DatDevice {
         val metadata = Wearables.devicesMetadata[this]?.value
@@ -345,6 +520,12 @@ class RealDatSessionController(
             kind = DatDeviceKind.RayBanMeta,
             compatibility = compatibility,
         )
+    }
+
+    private fun activeDeviceRequiresUpdate(): Boolean {
+        val device = activeDevice ?: return false
+        val metadata = Wearables.devicesMetadata[device]?.value
+        return metadata?.compatibility == DeviceCompatibility.DEVICE_UPDATE_REQUIRED
     }
 
     private fun RegistrationState.toDatRegistrationStatus(): DatRegistrationStatus =
@@ -418,4 +599,9 @@ class RealDatSessionController(
         }
         return output
     }
+
+    private data class StartupFailure(
+        val message: String,
+        val isTerminal: Boolean,
+    )
 }
