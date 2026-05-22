@@ -36,6 +36,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -86,7 +87,9 @@ private const val SETTINGS_NAME = "smart_glasses_agents_settings"
 private const val SETTINGS_HOST_URL = "host_url"
 private const val SETTINGS_PAIRING_TOKEN = "pairing_token"
 private const val SETTINGS_AGENT_PROFILE = "agent_profile"
+private const val SETTINGS_SPEECH_RATE = "speech_rate"
 private const val DEFAULT_HOST_URL = "http://192.168.0.243:8765"
+private const val DEFAULT_SPEECH_RATE = 1.0f
 
 @Composable
 fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBridge()) {
@@ -123,6 +126,9 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
     var latestResponse by remember { mutableStateOf<AnalyzeImageResponse?>(null) }
     var speechEnabled by remember { mutableStateOf(true) }
     var preferBluetoothSpeech by remember { mutableStateOf(false) }
+    var speechRate by remember {
+        mutableStateOf(settings.getFloat(SETTINGS_SPEECH_RATE, DEFAULT_SPEECH_RATE))
+    }
     var liveSamplingJob by remember { mutableStateOf<Job?>(null) }
     var liveIntervalSeconds by remember { mutableStateOf("5") }
     var liveMaxDurationSeconds by remember { mutableStateOf("60") }
@@ -154,6 +160,13 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                 .putString(SETTINGS_AGENT_PROFILE, selectedAgentProfile)
                 .apply()
         }
+    }
+
+    LaunchedEffect(speechRate) {
+        speechController.speechRate = speechRate
+        settings.edit()
+            .putFloat(SETTINGS_SPEECH_RATE, speechRate)
+            .apply()
     }
 
     val cameraLauncher = rememberLauncherForActivityResult(
@@ -277,8 +290,9 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
             }
     }
 
-    fun speak(text: String) {
+    suspend fun speak(text: String) {
         speechController.muted = !speechEnabled
+        speechController.speechRate = speechRate
         if (speechEnabled && preferBluetoothSpeech) {
             audioRouteController.preferBluetoothOutput()
         }
@@ -322,7 +336,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                         }
                     } else {
                         lastSpokenLiveText = ""
-                        speak(response.speechText)
+                        speak(response.fullReadoutText())
                     }
                 }
             }
@@ -581,8 +595,9 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
             SpeechPanel(
                 speechEnabled = speechEnabled,
                 preferBluetoothSpeech = preferBluetoothSpeech,
+                speechRate = speechRate,
                 audioRouteState = audioRouteState,
-                latestSpeechText = latestResponse?.speechText.orEmpty(),
+                latestSpeechText = latestResponse?.fullReadoutText().orEmpty(),
                 onSpeechEnabledChanged = {
                     speechEnabled = it
                     speechController.muted = !it
@@ -592,6 +607,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                     preferBluetoothSpeech = it
                     if (!it) audioRouteController.clearPreferredOutput()
                 },
+                onSpeechRateChanged = { speechRate = it },
                 onRefreshRoutes = { audioRouteController.refresh() },
                 onPreferBluetoothNow = {
                     audioRouteController.preferBluetoothOutput()
@@ -606,7 +622,11 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                     }
                 },
                 onStop = { speechController.stop() },
-                onReplay = { speak(latestResponse?.speechText.orEmpty()) }
+                onReplay = {
+                    coroutineScope.launch {
+                        speak(latestResponse?.fullReadoutText().orEmpty())
+                    }
+                }
             )
 
             ResultPanel(response = latestResponse)
@@ -955,10 +975,12 @@ private fun CapturePanel(
 private fun SpeechPanel(
     speechEnabled: Boolean,
     preferBluetoothSpeech: Boolean,
+    speechRate: Float,
     audioRouteState: AudioRouteState,
     latestSpeechText: String,
     onSpeechEnabledChanged: (Boolean) -> Unit,
     onPreferBluetoothChanged: (Boolean) -> Unit,
+    onSpeechRateChanged: (Float) -> Unit,
     onRefreshRoutes: () -> Unit,
     onPreferBluetoothNow: () -> Unit,
     onRequestBluetoothPermission: () -> Unit,
@@ -984,6 +1006,19 @@ private fun SpeechPanel(
                 Text("Replay")
             }
         }
+        Text(
+            text = "Readout speed: ${String.format(Locale.US, "%.1fx", speechRate)}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Slider(
+            value = speechRate,
+            onValueChange = onSpeechRateChanged,
+            valueRange = 0.5f..2.5f,
+            steps = 3,
+            enabled = speechEnabled,
+            modifier = Modifier.fillMaxWidth()
+        )
         Text(
             text = "Bluetooth outputs: ${
                 audioRouteState.bluetoothOutputs.joinToString { it.label }.ifBlank { "none detected" }
@@ -1058,7 +1093,14 @@ private fun ResultPanel(response: AnalyzeImageResponse?) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
-        Text(text = response.speechText, style = MaterialTheme.typography.bodyLarge)
+        Text(text = response.fullReadoutText(), style = MaterialTheme.typography.bodyLarge)
+        if (response.speechText.isNotBlank() && response.speechText != response.fullReadoutText()) {
+            Text(
+                text = "Short readout: ${response.speechText}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
         response.results.forEach { result ->
             AgentResultView(result = result)
         }
@@ -1144,6 +1186,17 @@ private fun parseSecondsSetting(
     value.toIntOrNull()
         ?.coerceIn(minSeconds, maxSeconds)
         ?: defaultSeconds
+
+private fun AnalyzeImageResponse.fullReadoutText(): String {
+    val selectedAnswer = results
+        .firstOrNull { it.agentProfile == selectedSpeechAgent }
+        ?.answer
+        ?.trim()
+        .orEmpty()
+    return selectedAnswer.ifBlank {
+        results.firstOrNull()?.answer?.trim().orEmpty().ifBlank { speechText }
+    }
+}
 
 @Preview(showBackground = true)
 @Composable

@@ -94,7 +94,7 @@ VLLM_TEMPERATURE = float(first_env(("VLLM_TEMPERATURE", "NEMOTRON_TEMPERATURE"),
 ENABLE_QWEN = env_bool(("GB10_ENABLE_QWEN", "ENABLE_QWEN"), "1")
 QWEN_BASE_URL = first_env(("QWEN_BASE_URL",), "http://127.0.0.1:8001/v1").rstrip("/")
 QWEN_HEALTH_URL = first_env(("QWEN_HEALTH_URL",), default_vllm_health_url(QWEN_BASE_URL)).rstrip("/")
-QWEN_MODEL = first_env(("QWEN_MODEL", "QWEN_MODEL_ID"), "Qwen/Qwen2.5-VL-72B-Instruct")
+QWEN_MODEL = first_env(("QWEN_MODEL", "QWEN_MODEL_ID"), "Qwen/Qwen2.5-VL-7B-Instruct")
 QWEN_AGENT_PROFILE = first_env(("QWEN_AGENT_PROFILE",), "local_qwen_detail")
 QWEN_API_KEY = first_env(("QWEN_API_KEY",), VLLM_API_KEY)
 QWEN_TIMEOUT_SECONDS = float(first_env(("QWEN_TIMEOUT_SECONDS",), str(VLLM_TIMEOUT_SECONDS)))
@@ -237,7 +237,14 @@ class Gb10Handler(BaseHTTPRequestHandler):
             return
 
         run_id = str(uuid.uuid4())
-        result = run_agent_profile(selected_profile, task_type, prompt, voice_transcript, image_base64)
+        result = run_agent_profile(
+            selected_profile,
+            task_type,
+            prompt,
+            voice_transcript,
+            image_base64,
+            capture_metadata=capture_metadata,
+        )
         results = [result]
         selected = result
         speech_text = make_speech_text(selected, task_type)
@@ -332,12 +339,14 @@ def run_agent_profile(
     user_prompt: str,
     voice_transcript: str,
     image_base64: str,
+    capture_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     agent_profile = profile["agent_profile"]
     model_id = profile["model_id"]
     runtime = profile["runtime"]
-    prompt = build_prompt(agent_profile, task_type, user_prompt, voice_transcript)
+    capture_source = (capture_metadata or {}).get("source", "unknown")
+    prompt = build_prompt(agent_profile, task_type, user_prompt, voice_transcript, capture_source)
 
     try:
         if runtime == "ollama":
@@ -480,12 +489,26 @@ def persist_raw_image(run_id: str, image_base64: str, image_mime_type: str) -> s
     return str(path)
 
 
-def build_prompt(agent_profile: str, task_type: str, user_prompt: str, voice_transcript: str) -> str:
+def build_prompt(
+    agent_profile: str,
+    task_type: str,
+    user_prompt: str,
+    voice_transcript: str,
+    capture_source: str = "unknown",
+) -> str:
     shared = (
         "You are assisting a smart-glasses experiment. Be concise and practical. "
         "Report uncertainty when fine details are unclear. Do not identify people by name. "
-        "For faces, only count, locate, and give non-identifying visible descriptions."
+        "For faces, only count, locate, and give non-identifying visible descriptions. "
+        "For spatial descriptions, use image-left and image-right as seen in the image. "
+        "Do not swap left and right to infer the wearer's body-relative perspective."
     )
+    capture_note = ""
+    if capture_source == "rayban_meta_dat":
+        capture_note = (
+            "Image capture note: this image is from a single off-centre right-side glasses camera "
+            "(not stereo, not center-of-head). Use image-left/image-right exactly as shown."
+        )
     task_instruction = {
         "board_text": (
             "Task: read visible board text. Preserve wording when legible. "
@@ -493,7 +516,7 @@ def build_prompt(agent_profile: str, task_type: str, user_prompt: str, voice_tra
         ),
         "tabletop_items": (
             "Task: identify small items on the table and describe approximate positions "
-            "relative to the camera and table."
+            "using image-left/image-right and near/far relative to the camera."
         ),
         "faces": (
             "Task: count visible faces and describe approximate positions only. "
@@ -512,7 +535,11 @@ def build_prompt(agent_profile: str, task_type: str, user_prompt: str, voice_tra
         if voice_transcript
         else "Spoken user query transcript: none"
     )
-    return "\n".join([shared, task_instruction, profile_instruction, f"User prompt: {user_prompt}", spoken])
+    parts = [shared]
+    if capture_note:
+        parts.append(capture_note)
+    parts.extend([task_instruction, profile_instruction, f"User prompt: {user_prompt}", spoken])
+    return "\n".join(parts)
 
 
 def ollama_generate(model_id: str, prompt: str, image_base64: str) -> str:
@@ -741,8 +768,7 @@ def make_speech_text(result: dict[str, Any], task_type: str) -> str:
         prefix = "Non-identifying face result: "
     else:
         prefix = ""
-    clipped = cleaned[:220].rsplit(" ", 1)[0] if len(cleaned) > 220 else cleaned
-    return f"{prefix}{clipped}"
+    return f"{prefix}{cleaned}"
 
 
 def extract_observations(answer: str) -> list[str]:

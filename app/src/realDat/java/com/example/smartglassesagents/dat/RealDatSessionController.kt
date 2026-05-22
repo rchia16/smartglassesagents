@@ -8,6 +8,7 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.util.Log
 import androidx.exifinterface.media.ExifInterface
 import com.meta.wearable.dat.camera.Stream
 import com.meta.wearable.dat.camera.addStream
@@ -23,6 +24,7 @@ import com.meta.wearable.dat.core.session.DeviceSessionState
 import com.meta.wearable.dat.core.types.DeviceCompatibility
 import com.meta.wearable.dat.core.types.DeviceSessionError
 import com.meta.wearable.dat.core.types.DeviceIdentifier
+import com.meta.wearable.dat.core.types.LinkState
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
@@ -45,6 +47,10 @@ class RealDatSessionController(
     private val coroutineScope: CoroutineScope,
     private val permissionBridge: DatPermissionBridge,
 ) : DatSessionController {
+    private companion object {
+        const val TAG = "SmartGlassesDAT"
+    }
+
     private val _state = MutableStateFlow(
         DatDeviceState(
             adapterName = "Meta Wearables DAT adapter",
@@ -65,6 +71,7 @@ class RealDatSessionController(
     private var stream: Stream? = null
     private var latestFrame: Bitmap? = null
     private var registrationJob: Job? = null
+    private var registrationErrorJob: Job? = null
     private var deviceJob: Job? = null
     private var deviceSessionJob: Job? = null
     private var sessionErrorJob: Job? = null
@@ -76,14 +83,17 @@ class RealDatSessionController(
     override fun startMonitoring() {
         if (monitoringStarted) return
         monitoringStarted = true
+        Log.i(TAG, "Initializing Meta Wearables DAT")
         runCatching { Wearables.initialize(context) }
             .onFailure { error ->
+                Log.e(TAG, "DAT initialization failed", error)
                 setError("DAT initialization failed: ${error.message ?: error::class.java.simpleName}")
                 return
             }
 
         registrationJob = coroutineScope.launch {
             Wearables.registrationState.collect { registrationState ->
+                Log.i(TAG, "Registration state: $registrationState")
                 _state.update {
                     it.copy(
                         registrationStatus = registrationState.toDatRegistrationStatus(),
@@ -92,11 +102,27 @@ class RealDatSessionController(
                 }
             }
         }
+        registrationErrorJob = coroutineScope.launch {
+            Wearables.registrationErrorStream.collect { error ->
+                val detail = error.descriptionOrType()
+                Log.e(TAG, "Registration error: $detail")
+                setError("DAT registration error: $detail")
+            }
+        }
         deviceJob = coroutineScope.launch {
             Wearables.devices.collect { devices ->
-                val selectedDevice = activeDevice?.takeIf { it in devices } ?: devices.firstOrNull()
+                val selectedDevice =
+                    activeDevice?.takeIf { it in devices && it.isEligibleForSession() }
+                        ?: devices.firstOrNull { it.isEligibleForSession() }
+                        ?: activeDevice?.takeIf { it in devices }
+                        ?: devices.firstOrNull()
                 activeDevice = selectedDevice
                 selectedDeviceFlow.value = selectedDevice
+                Log.i(
+                    TAG,
+                    "Devices: count=${devices.size}, selected=${selectedDevice ?: "none"}, " +
+                        "metadata=${devices.joinToString { it.describeDeviceForLogs() }}"
+                )
                 _state.update {
                     it.copy(
                         devices = devices.map { device -> device.toDatDevice() },
@@ -115,8 +141,12 @@ class RealDatSessionController(
             setError("DAT registration requires an Activity context.")
             return
         }
+        Log.i(TAG, "Starting DAT registration")
         runCatching { Wearables.startRegistration(activity) }
-            .onFailure { error -> setError("DAT registration failed: ${error.message ?: error::class.java.simpleName}") }
+            .onFailure { error ->
+                Log.e(TAG, "DAT registration failed", error)
+                setError("DAT registration failed: ${error.message ?: error::class.java.simpleName}")
+            }
     }
 
     override fun unregister() {
@@ -126,8 +156,12 @@ class RealDatSessionController(
             setError("DAT unregistration requires an Activity context.")
             return
         }
+        Log.i(TAG, "Starting DAT unregistration")
         runCatching { Wearables.startUnregistration(activity) }
-            .onFailure { error -> setError("DAT unregistration failed: ${error.message ?: error::class.java.simpleName}") }
+            .onFailure { error ->
+                Log.e(TAG, "DAT unregistration failed", error)
+                setError("DAT unregistration failed: ${error.message ?: error::class.java.simpleName}")
+            }
     }
 
     override fun discoverMockDevice() {
@@ -161,6 +195,11 @@ class RealDatSessionController(
         terminalStartupError = null
         val current = _state.value
         val device = activeDevice
+        Log.i(
+            TAG,
+            "Start session requested: registration=${current.registrationStatus}, " +
+                "device=${device ?: "none"}, camera=${current.cameraPermissionStatus}"
+        )
 
         when {
             current.registrationStatus != DatRegistrationStatus.Registered -> {
@@ -168,6 +207,12 @@ class RealDatSessionController(
             }
             device == null -> {
                 setError("Pair and connect Ray-Ban Meta glasses before starting a DAT session.")
+            }
+            !device.isEligibleForSession() -> {
+                setError(
+                    "Ray-Ban Meta glasses are not available for a DAT session. " +
+                        device.describeDeviceForLogs()
+                )
             }
             activeDeviceRequiresUpdate() -> {
                 setError("Ray-Ban Meta glasses need a firmware update before DAT camera can start.")
@@ -180,6 +225,7 @@ class RealDatSessionController(
     }
 
     override fun stopSession() {
+        Log.i(TAG, "Stopping DAT session")
         streamErrorJob?.cancel()
         streamErrorJob = null
         sessionErrorJob?.cancel()
@@ -266,6 +312,7 @@ class RealDatSessionController(
             val sessionResult = Wearables.createSession(deviceSelector)
             val session = sessionResult.getOrNull()
             if (session == null) {
+                Log.e(TAG, "DAT session creation failed: ${sessionResult.failureDescription()}")
                 setError("DAT session creation failed: ${sessionResult.failureDescription()}.")
                 return@launch
             }
@@ -277,6 +324,7 @@ class RealDatSessionController(
             sessionErrorJob?.cancel()
             sessionErrorJob = coroutineScope.launch {
                 session.errors.collect { error ->
+                    Log.e(TAG, "Device session error: ${error.descriptionOrType()}")
                     if (error == DeviceSessionError.SESSION_ENDED_BY_DEVICE && terminalStartupError != null) {
                         return@collect
                     }
@@ -295,6 +343,7 @@ class RealDatSessionController(
             deviceSessionJob?.cancel()
             deviceSessionJob = coroutineScope.launch {
                 session.state.collect { deviceState ->
+                    Log.i(TAG, "Device session state: $deviceState")
                     _state.update { it.copy(deviceSessionState = deviceState.name) }
                 }
             }
@@ -309,6 +358,7 @@ class RealDatSessionController(
             try {
                 session.start()
             } catch (error: Throwable) {
+                Log.e(TAG, "DAT device session start threw", error)
                 setError("DAT device session start failed: ${error.message ?: error::class.java.simpleName}.")
                 cleanupFailedStart(session)
                 return@launch
@@ -346,11 +396,12 @@ class RealDatSessionController(
             }
 
             val streamResult = session.addStream(
-                StreamConfiguration(videoQuality = VideoQuality.LOW, 15),
+                StreamConfiguration(videoQuality = VideoQuality.HIGH, 30),
             )
 
             val createdStream = streamResult.getOrNull()
             if (createdStream == null) {
+                Log.e(TAG, "DAT stream creation failed: ${streamResult.failureDescription()}")
                 setError("DAT stream creation failed: ${streamResult.failureDescription()}.")
                 cleanupFailedStart(session)
                 return@launch
@@ -360,6 +411,7 @@ class RealDatSessionController(
             stateJob?.cancel()
             stateJob = coroutineScope.launch {
                 createdStream.state.collect { streamState ->
+                    Log.i(TAG, "Stream state: $streamState")
                     _state.update {
                         when (streamState) {
                             StreamState.STREAMING -> it.copy(
@@ -388,6 +440,7 @@ class RealDatSessionController(
             streamErrorJob?.cancel()
             streamErrorJob = coroutineScope.launch {
                 createdStream.errorStream.collect { error ->
+                    Log.e(TAG, "Stream error: ${error.descriptionOrType()}")
                     _state.update {
                         it.copy(
                             sessionStatus = DatSessionStatus.Error,
@@ -414,6 +467,7 @@ class RealDatSessionController(
 
             val streamStartResult = createdStream.start()
             if (streamStartResult.getOrNull() == null) {
+                Log.e(TAG, "DAT stream start failed: ${streamStartResult.failureDescription()}")
                 setError("DAT stream start failed: ${streamStartResult.failureDescription()}.")
                 stream = null
                 cleanupFailedStart(session)
@@ -511,6 +565,7 @@ class RealDatSessionController(
         val name = metadata?.name?.ifBlank { toString() } ?: toString()
         val compatibility = when (metadata?.compatibility) {
             DeviceCompatibility.DEVICE_UPDATE_REQUIRED -> DatDeviceCompatibility.UpdateRequired
+            DeviceCompatibility.SDK_UPDATE_REQUIRED -> DatDeviceCompatibility.UpdateRequired
             null -> DatDeviceCompatibility.Unknown
             else -> DatDeviceCompatibility.Compatible
         }
@@ -525,7 +580,30 @@ class RealDatSessionController(
     private fun activeDeviceRequiresUpdate(): Boolean {
         val device = activeDevice ?: return false
         val metadata = Wearables.devicesMetadata[device]?.value
-        return metadata?.compatibility == DeviceCompatibility.DEVICE_UPDATE_REQUIRED
+        return metadata?.compatibility == DeviceCompatibility.DEVICE_UPDATE_REQUIRED ||
+            metadata?.compatibility == DeviceCompatibility.SDK_UPDATE_REQUIRED
+    }
+
+    private fun DeviceIdentifier.isEligibleForSession(): Boolean {
+        val metadata = Wearables.devicesMetadata[this]?.value ?: return false
+        return metadata.linkState == LinkState.CONNECTED &&
+            metadata.compatibility != DeviceCompatibility.DEVICE_UPDATE_REQUIRED &&
+            metadata.compatibility != DeviceCompatibility.SDK_UPDATE_REQUIRED
+    }
+
+    private fun DeviceIdentifier.describeDeviceForLogs(): String {
+        val metadata = Wearables.devicesMetadata[this]?.value
+        val thermalLevel = Wearables.getDeviceState(this).value.thermalLevel
+        return if (metadata == null) {
+            "$this metadata=unknown"
+        } else {
+            "$this name=${metadata.name.ifBlank { "unknown" }} " +
+                "linkState=${metadata.linkState} " +
+                "compatibility=${metadata.compatibility} " +
+                "deviceType=${metadata.deviceType} " +
+                "firmware=${metadata.firmwareInfo?.ifBlank { "unknown" } ?: "unknown"} " +
+                "thermal=$thermalLevel"
+        }
     }
 
     private fun RegistrationState.toDatRegistrationStatus(): DatRegistrationStatus =

@@ -30,7 +30,7 @@
 
         <meta-data
             android:name="com.meta.wearable.mwdat.APPLICATION_ID"
-            android:value="${metaWearablesApplicationId}" />
+            android:value="\${metaWearablesApplicationId}" />
         <meta-data
             android:name="com.meta.wearable.mwdat.CLIENT_TOKEN"
             android:value="${metaWearablesClientToken}" />
