@@ -25,3 +25,4 @@ gb10-host/data/
 .idea/
 *.iml
 */build/
+models/
