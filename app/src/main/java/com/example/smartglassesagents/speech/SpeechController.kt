@@ -5,6 +5,8 @@ import android.media.AudioAttributes
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
@@ -15,6 +17,7 @@ class SpeechController(context: Context) : TextToSpeech.OnInitListener {
     private var ready = false
     private val pendingUtterances = ConcurrentHashMap<String, (Boolean) -> Unit>()
     private val utteranceSeq = AtomicLong(0L)
+    private val speechMutex = Mutex()
     var muted: Boolean = false
     var speechRate: Float = 1.0f
         set(value) {
@@ -60,16 +63,18 @@ class SpeechController(context: Context) : TextToSpeech.OnInitListener {
 
     suspend fun speak(text: String): Boolean {
         if (!ready || muted || text.isBlank()) return false
-        // Android TTS can truncate very long strings; speak in chunks and await completion.
-        stop()
-        val chunks = chunkText(text.trim(), MAX_UTTERANCE_CHARS)
-        var first = true
-        for (chunk in chunks) {
-            val ok = speakChunk(chunk, flush = first)
-            if (!ok) return false
-            first = false
+        return speechMutex.withLock {
+            // Android TTS can truncate long strings; speak in small chunks and await each one.
+            stop()
+            val chunks = chunkText(text.trim(), MAX_UTTERANCE_CHARS)
+            var first = true
+            for (chunk in chunks) {
+                val ok = speakChunk(chunk, flush = first)
+                if (!ok) return@withLock false
+                first = false
+            }
+            true
         }
-        return true
     }
 
     fun stop() {
@@ -135,6 +140,6 @@ class SpeechController(context: Context) : TextToSpeech.OnInitListener {
     private companion object {
         const val MIN_SPEECH_RATE = 0.5f
         const val MAX_SPEECH_RATE = 1.5f
-        const val MAX_UTTERANCE_CHARS = 3000
+        const val MAX_UTTERANCE_CHARS = 1000
     }
 }

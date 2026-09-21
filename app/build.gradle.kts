@@ -43,7 +43,7 @@ android {
         manifestPlaceholders["metaWearablesClientToken"] = metaWearablesClientToken
     }
 
-    flavorDimensions += "dat"
+    flavorDimensions += listOf("dat", "inference")
     productFlavors {
         create("mockDat") {
             dimension = "dat"
@@ -54,6 +54,18 @@ android {
             dimension = "dat"
             buildConfigField("String", "DAT_MODE", "\"real\"")
             minSdk = 29
+        }
+        create("gb10Host") {
+            dimension = "inference"
+            buildConfigField("String", "INFERENCE_MODE", "\"gb10_host\"")
+        }
+        create("phoneLocal") {
+            dimension = "inference"
+            buildConfigField("String", "INFERENCE_MODE", "\"phone_local\"")
+            minSdk = 26
+            ndk {
+                abiFilters += "arm64-v8a"
+            }
         }
     }
 
@@ -77,6 +89,10 @@ android {
         compose = true
         buildConfig = true
     }
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
+    assetPacks += listOf(":fastvlm_assets")
 }
 
 gradle.taskGraph.whenReady {
@@ -120,4 +136,5 @@ dependencies {
     "realDatImplementation"(libs.mwdat.core)
     "realDatImplementation"(libs.mwdat.camera)
     "realDatImplementation"(libs.mwdat.mockdevice)
+    "phoneLocalImplementation"(libs.play.asset.delivery)
 }

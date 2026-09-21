@@ -81,7 +81,7 @@ class MockDatSessionController : DatSessionController {
         _state.update { it.copy(sessionStatus = DatSessionStatus.Stopped, recentError = null) }
     }
 
-    override fun captureFrame(): Bitmap? {
+    override suspend fun captureFrame(): Bitmap? {
         if (!_state.value.isReadyForCapture) {
             setError("Start a DAT session before capturing a frame.")
             return null
