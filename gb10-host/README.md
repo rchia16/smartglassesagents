@@ -164,6 +164,60 @@ them, delete the two files under `~/.config/systemd/user/`, then run
 `systemctl --user daemon-reload`. Only disable linger if this user has no
 other services that need to run after logout.
 
+### After a GB10 reboot
+
+The user services and Tailscale Serve route are intended to survive a reboot.
+Check both parts before using the Android app. Run the following as **`rchia`**
+(log in directly or use `su - rchia`):
+
+```bash
+systemctl --user status gb10-qwen.service gb10-api.service --no-pager
+curl -sS -o /dev/null -w 'Qwen HTTP %{http_code}\n' --max-time 5 http://127.0.0.1:8001/health
+curl -i --max-time 5 http://127.0.0.1:8765/health
+```
+
+Both services should be `active (running)`. Qwen's `/health` can have an empty
+body; `HTTP 200` is the useful result. The API response should be HTTP 200
+with `"service": "gb10-local-host"` and `"qwen_reachable": true`. Model
+loading can take a few minutes after boot; repeat the checks once it finishes.
+If a service did not start, run as `rchia`:
+
+```bash
+systemctl --user enable --now gb10-qwen.service gb10-api.service
+journalctl --user -u gb10-qwen.service -u gb10-api.service -b --no-pager -n 100
+```
+
+Then, as **`gbten`** (the admin account), check the tailnet route and the
+same URL used by the app:
+
+```bash
+loginctl show-user rchia -p Linger
+sudo tailscale serve status
+curl -i --max-time 5 https://promaxgb10-4e2b.tail06a565.ts.net:9443/health
+curl -i --max-time 5 https://promaxgb10-4e2b.tail06a565.ts.net:9443/models
+```
+
+`Linger=yes` lets `rchia`'s user services start at boot. If it says `no`, run
+`sudo loginctl enable-linger rchia`. The `:9443` Serve entry must say
+`proxy http://127.0.0.1:8765`. On 27 October 2026 it had been changed to
+`127.0.0.1:18083`; the HTTPS request then returned HTTP 404 even though both
+local services were healthy. If `:9443` points elsewhere or is missing, and
+this port is still dedicated to the glasses API, restore only that mapping:
+
+```bash
+sudo tailscale serve --bg --https=9443 http://127.0.0.1:8765
+curl -i --max-time 5 https://promaxgb10-4e2b.tail06a565.ts.net:9443/health
+```
+
+Expect HTTP 200 and `Server: GB10Host/...`. This command replaces the prior
+`:9443` target while leaving the other Serve and Funnel ports alone. In the
+Android app, use `https://promaxgb10-4e2b.tail06a565.ts.net:9443` as the
+Host URL, without `/health` or `/v1`, and make sure the phone is connected to
+the tailnet. If local health is 200 but HTTPS still fails after the mapping
+check, inspect `sudo tailscale serve status` and the exact HTTP response before
+restarting either service. Public DNS lookups using `1.1.1.1` can show Funnel
+relay addresses and do not verify this tailnet-only Serve route.
+
 ### Tailscale HTTPS name
 
 If port `9443` is not already mapped to the GB10 API, configure Tailscale
