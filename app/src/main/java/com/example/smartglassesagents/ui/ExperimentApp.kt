@@ -7,7 +7,9 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.os.Build
+import android.provider.MediaStore
 import android.speech.RecognizerIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -57,7 +59,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.example.smartglassesagents.BuildConfig
+import com.example.smartglassesagents.capture.CapturedClip
+import com.example.smartglassesagents.capture.stripAudioFromMp4
 import com.example.smartglassesagents.dat.DatDeviceState
 import com.example.smartglassesagents.dat.DatPermissionBridge
 import com.example.smartglassesagents.dat.NoOpDatPermissionBridge
@@ -69,6 +74,7 @@ import com.example.smartglassesagents.experiment.TaskType
 import com.example.smartglassesagents.inference.createImageAnalyzer
 import com.example.smartglassesagents.network.AgentResult
 import com.example.smartglassesagents.network.AnalyzeImageRequest
+import com.example.smartglassesagents.network.AnalyzeClipRequest
 import com.example.smartglassesagents.network.AnalyzeImageResponse
 import com.example.smartglassesagents.network.ModelProfile
 import com.example.smartglassesagents.speech.AudioRouteController
@@ -76,11 +82,14 @@ import com.example.smartglassesagents.speech.AudioRouteState
 import com.example.smartglassesagents.speech.SpeechController
 import com.example.smartglassesagents.ui.theme.SmartGlassesAgentsTheme
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import java.util.UUID
+import java.io.File
 
 private const val SETTINGS_NAME = "smart_glasses_agents_settings"
 private const val SETTINGS_HOST_URL = "host_url"
@@ -99,6 +108,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
     val coroutineScope = rememberCoroutineScope()
     val sessionId = remember { UUID.randomUUID().toString() }
     val speechController = remember { SpeechController(context) }
+    val speechStatus by speechController.status.collectAsState()
     val audioRouteController = remember { AudioRouteController(context) }
     val audioRouteState by audioRouteController.state.collectAsState()
     val datController = remember {
@@ -126,6 +136,10 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
     }
     var voiceTranscript by remember { mutableStateOf("") }
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var capturedClip by remember { mutableStateOf<CapturedClip?>(null) }
+    var clipBusy by remember { mutableStateOf(false) }
+    var pendingPhoneClipFile by remember { mutableStateOf<File?>(null) }
+    var pendingPhoneClipAtMs by remember { mutableStateOf(0L) }
     var captureSource by remember { mutableStateOf(CaptureSource.PhoneCamera) }
     var status by remember { mutableStateOf<ExperimentStatus>(ExperimentStatus.Idle) }
     var latestResponse by remember { mutableStateOf<AnalyzeImageResponse?>(null) }
@@ -149,6 +163,8 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
         onDispose {
             liveSamplingJob?.cancel()
             speechController.shutdown()
+            capturedClip?.file?.delete()
+            pendingPhoneClipFile?.delete()
         }
     }
 
@@ -199,6 +215,66 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
             cameraLauncher.launch(null)
         } else {
             status = ExperimentStatus.Error("Camera permission is required for phone capture.")
+        }
+    }
+
+    val phoneClipLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val file = pendingPhoneClipFile
+        val startedAt = pendingPhoneClipAtMs
+        pendingPhoneClipFile = null
+        if (file == null) {
+            clipBusy = false
+            return@rememberLauncherForActivityResult
+        }
+        if (result.resultCode != Activity.RESULT_OK) {
+            file.delete()
+            clipBusy = false
+            status = ExperimentStatus.Ready("Phone clip capture cancelled.")
+            return@rememberLauncherForActivityResult
+        }
+        coroutineScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    if (file.length() == 0L) {
+                        val uri = result.data?.data
+                            ?: error("Phone camera did not return a video clip.")
+                        context.contentResolver.openInputStream(uri)?.use { input ->
+                            file.outputStream().use(input::copyTo)
+                        } ?: error("Could not read the phone camera clip.")
+                    }
+                    check(file.length() in 1..8_000_000) { "Phone clip exceeds 8 MB." }
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(file.absolutePath)
+                        val mimeType = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE)
+                        check(mimeType == "video/mp4") { "Phone camera must return an MP4 clip." }
+                        val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                            ?.toLongOrNull() ?: 0L
+                        check(duration in 500..3_000) { "Phone clip must be about two seconds long." }
+                        val frameCount = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)
+                                ?.toIntOrNull() ?: (duration / 100).toInt()
+                        } else (duration / 100).toInt()
+                        check(frameCount in 2..120) { "Phone clip has an invalid frame count." }
+                        val silentFile = stripAudioFromMp4(file, context.cacheDir)
+                        file.delete()
+                        CapturedClip(silentFile, CaptureSource.PhoneCamera, startedAt, duration, frameCount)
+                    } finally {
+                        retriever.release()
+                    }
+                }
+            }.onSuccess { clip ->
+                capturedClip?.file?.delete()
+                capturedClip = clip
+                latestResponse = null
+                status = ExperimentStatus.Ready("Two-second phone clip ready to send.")
+            }.onFailure { error ->
+                file.delete()
+                status = ExperimentStatus.Error(error.message ?: "Phone clip capture failed.")
+            }
+            clipBusy = false
         }
     }
 
@@ -617,6 +693,94 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                 }
             )
 
+            if (BuildConfig.INFERENCE_MODE == "gb10_host") {
+                ClipPanel(
+                    clip = capturedClip,
+                    busy = clipBusy,
+                    datCaptureEnabled = datState.isReadyForCapture,
+                    onCaptureDatClip = {
+                        clipBusy = true
+                        status = ExperimentStatus.Ready("Recording two seconds from glasses…")
+                        coroutineScope.launch {
+                            runCatching { datController.captureClip(context.cacheDir) }
+                                .onSuccess { clip ->
+                                    if (clip == null) {
+                                        status = ExperimentStatus.Error("DAT clip capture returned no video.")
+                                    } else {
+                                        capturedClip?.file?.delete()
+                                        capturedClip = clip
+                                        latestResponse = null
+                                        status = ExperimentStatus.Ready("Two-second glasses clip ready to send.")
+                                    }
+                                }
+                                .onFailure { error ->
+                                    status = ExperimentStatus.Error(error.message ?: "DAT clip capture failed.")
+                                }
+                            clipBusy = false
+                        }
+                    },
+                    onCapturePhoneClip = {
+                        runCatching {
+                            val file = File.createTempFile("phone-clip-", ".mp4", context.cacheDir)
+                            val uri = FileProvider.getUriForFile(
+                                context, "${context.packageName}.fileprovider", file
+                            )
+                            pendingPhoneClipFile = file
+                            pendingPhoneClipAtMs = System.currentTimeMillis()
+                            clipBusy = true
+                            val intent = Intent(MediaStore.ACTION_VIDEO_CAPTURE).apply {
+                                putExtra(MediaStore.EXTRA_OUTPUT, uri)
+                                putExtra(MediaStore.EXTRA_DURATION_LIMIT, 2)
+                                putExtra(MediaStore.EXTRA_VIDEO_QUALITY, 1)
+                                addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            phoneClipLauncher.launch(intent)
+                        }.onFailure { error ->
+                            pendingPhoneClipFile?.delete()
+                            pendingPhoneClipFile = null
+                            clipBusy = false
+                            status = ExperimentStatus.Error(error.message ?: "Could not open phone video camera.")
+                        }
+                    },
+                    onSendClip = {
+                        val clip = capturedClip
+                        if (clip == null) {
+                            status = ExperimentStatus.Error("Record a clip before sending.")
+                            return@ClipPanel
+                        }
+                        val profile = availableModels.firstOrNull { it.agentProfile == selectedAgentProfile }
+                        if (profile == null || !profile.modelId.contains("qwen", ignoreCase = true)) {
+                            status = ExperimentStatus.Error("Select the Qwen model for clip analysis.")
+                            return@ClipPanel
+                        }
+                        clipBusy = true
+                        status = ExperimentStatus.Ready("Sending clip to GB10…")
+                        coroutineScope.launch {
+                            val request = AnalyzeClipRequest(
+                                sessionId, selectedTask, prompt, voiceTranscript, selectedAgentProfile,
+                                "", clip.source, clip.capturedAtMs, clip.durationMs, clip.frameCount
+                            )
+                            val analysis = try {
+                                imageAnalyzer.analyzeClip(request, clip.file)
+                            } catch (error: Exception) {
+                                Result.failure(error)
+                            } finally {
+                                clip.file.delete()
+                                capturedClip = null
+                                clipBusy = false
+                            }
+                            analysis.onSuccess { response ->
+                                latestResponse = response
+                                status = ExperimentStatus.Ready("Received ${response.selectedSpeechAgent} clip result.")
+                                speak(response.spokenText())
+                            }.onFailure { error ->
+                                status = ExperimentStatus.Error(error.message ?: "Clip analysis failed.")
+                            }
+                        }
+                    }
+                )
+            }
+
             LiveSamplingPanel(
                 isLiveSampling = isLiveSampling,
                 sampleCount = liveSampleCount,
@@ -632,6 +796,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
 
             SpeechPanel(
                 speechEnabled = speechEnabled,
+                speechStatus = speechStatus,
                 preferBluetoothSpeech = preferBluetoothSpeech,
                 speechRate = speechRate,
                 audioRouteState = audioRouteState,
@@ -660,6 +825,11 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                     }
                 },
                 onStop = { speechController.stop() },
+                onTestSpeech = {
+                    coroutineScope.launch {
+                        speak("This is a speech test from Smart Glasses Agents.")
+                    }
+                },
                 onReplay = {
                     coroutineScope.launch {
                         speak(latestResponse?.spokenText().orEmpty())
@@ -688,6 +858,44 @@ private fun Header(status: ExperimentStatus) {
                 else -> MaterialTheme.colorScheme.onSurfaceVariant
             }
         )
+    }
+}
+
+@Composable
+private fun ClipPanel(
+    clip: CapturedClip?,
+    busy: Boolean,
+    datCaptureEnabled: Boolean,
+    onCaptureDatClip: () -> Unit,
+    onCapturePhoneClip: () -> Unit,
+    onSendClip: () -> Unit
+) {
+    Section(title = "Two-second video clip") {
+        Text(
+            text = "Record silent video from the glasses stream or phone camera. Select Qwen to analyze motion and changes across the clip.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = onCaptureDatClip, enabled = datCaptureEnabled && !busy) {
+                Text("Record glasses")
+            }
+            TextButton(onClick = onCapturePhoneClip, enabled = !busy) {
+                Text("Record phone")
+            }
+        }
+        Text(
+            text = when {
+                busy -> "Recording or sending clip…"
+                clip != null -> "${clip.source.label}: ${clip.durationMs} ms, ${clip.frameCount} frames, ${clip.file.length()} bytes"
+                else -> "No clip recorded."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Button(onClick = onSendClip, enabled = clip != null && !busy) {
+            Text("Send clip to GB10")
+        }
     }
 }
 
@@ -872,7 +1080,7 @@ private fun ConnectionPanel(
             modifier = Modifier.fillMaxWidth()
         )
         Text(
-            text = "Use http://10.0.2.2:8765 only in the Android emulator. A physical phone needs the desktop/GB10 Wi-Fi IP, for example http://192.168.0.194:8765 on the current network.",
+            text = "Emulator: http://10.0.2.2:8765. Physical phone: use the GB10 LAN URL, or connect the phone to Tailscale and use https://promaxgb10-4e2b.tail06a565.ts.net:9443.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -1028,6 +1236,7 @@ private fun CapturePanel(
 @OptIn(ExperimentalLayoutApi::class)
 private fun SpeechPanel(
     speechEnabled: Boolean,
+    speechStatus: String,
     preferBluetoothSpeech: Boolean,
     speechRate: Float,
     audioRouteState: AudioRouteState,
@@ -1039,6 +1248,7 @@ private fun SpeechPanel(
     onPreferBluetoothNow: () -> Unit,
     onRequestBluetoothPermission: () -> Unit,
     onStop: () -> Unit,
+    onTestSpeech: () -> Unit,
     onReplay: () -> Unit
 ) {
     Section(title = "Speech readout") {
@@ -1053,6 +1263,9 @@ private fun SpeechPanel(
             Switch(checked = speechEnabled, onCheckedChange = onSpeechEnabledChanged)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            TextButton(onClick = onTestSpeech, enabled = speechEnabled) {
+                Text("Test voice")
+            }
             TextButton(onClick = onStop) {
                 Text("Stop")
             }
@@ -1060,6 +1273,11 @@ private fun SpeechPanel(
                 Text("Replay")
             }
         }
+        Text(
+            text = speechStatus,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
         Text(
             text = "Readout speed: ${String.format(Locale.US, "%.1fx", speechRate)}",
             style = MaterialTheme.typography.bodySmall,

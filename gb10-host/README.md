@@ -14,9 +14,11 @@ python .\gb10-host\mock_server.py
 
 The server listens on `0.0.0.0:8765` by default.
 
-On the GB10 (Linux), run it from this directory with:
+On the GB10 (Linux), where `mock_server.py` is in
+`/home/rchia/projects/rayban-vlm`, run it as `rchia` with:
 
 ```bash
+cd /home/rchia/projects/rayban-vlm
 apptainer exec ~/containers/vllm.sif python mock_server.py
 ```
 
@@ -57,20 +59,20 @@ without `/health` or `/v1`. Confirm the URL serves this API with
 
 ## Keep Qwen and the API running on the GB10 (systemd)
 
-These **user services** reproduce the working Apptainer commands. Run the
-following on the GB10 as the Linux user who owns `~/containers/vllm.sif` and
-the model cache. Run it from the repository's `gb10-host` directory. The
-container must already provide `fix-nvidia-libpath` and
-`start-vllm-qwen25-vl`, as in the image used for the working manual command.
+These **user services** reproduce the working Apptainer commands. Log in to
+the GB10 as `rchia` and run the block below in that account's shell. The
+services belong to `rchia`; creating them from the admin account would use
+the admin account's home directory and model cache. The container must already
+provide `fix-nvidia-libpath` and `start-vllm-qwen25-vl`, as in the image used
+for the working manual command.
 The checked-in `vllm.def` currently defines a differently named Qwen helper,
 so building that file as-is does not provide these two commands.
 
 ```bash
-cd /path/to/SmartGlassesAgents/gb10-host
-GB10_REPO_DIR="$(pwd -P)"
+cd /home/rchia/projects/rayban-vlm
 GB10_APPTAINER="$(command -v apptainer)"
 test -f "$HOME/containers/vllm.sif"
-test -f "$GB10_REPO_DIR/mock_server.py"
+test -f /home/rchia/projects/rayban-vlm/mock_server.py
 mkdir -p "$HOME/.config/systemd/user"
 
 cat > "$HOME/.config/systemd/user/gb10-qwen.service" <<EOF
@@ -95,8 +97,8 @@ After=gb10-qwen.service
 
 [Service]
 Type=simple
-WorkingDirectory=$GB10_REPO_DIR
-ExecStart=$GB10_APPTAINER exec --bind $GB10_REPO_DIR:$GB10_REPO_DIR --env GB10_HOST=127.0.0.1 --env GB10_ENABLE_OLLAMA=0 --env GB10_ENABLE_VLLM=0 --env GB10_ENABLE_QWEN=1 --env QWEN_BASE_URL=http://127.0.0.1:8001/v1 --env QWEN_MODEL=Qwen/Qwen3-VL-8B-Instruct $HOME/containers/vllm.sif python mock_server.py
+WorkingDirectory=/home/rchia/projects/rayban-vlm
+ExecStart=$GB10_APPTAINER exec --bind /home/rchia/projects/rayban-vlm:/home/rchia/projects/rayban-vlm --env GB10_HOST=127.0.0.1 --env GB10_ENABLE_OLLAMA=0 --env GB10_ENABLE_VLLM=0 --env GB10_ENABLE_QWEN=1 --env QWEN_BASE_URL=http://127.0.0.1:8001/v1 --env QWEN_MODEL=Qwen/Qwen3-VL-8B-Instruct $HOME/containers/vllm.sif python mock_server.py
 Restart=on-failure
 RestartSec=5
 
@@ -106,21 +108,26 @@ EOF
 
 systemctl --user daemon-reload
 systemctl --user enable --now gb10-qwen.service gb10-api.service
-sudo loginctl enable-linger "$(id -un)"
+```
+
+Then log in to the **admin account** on the GB10 and run:
+
+```bash
+sudo loginctl enable-linger rchia
+loginctl show-user rchia -p Linger
 ```
 
 `enable --now` starts both services and enables them at login. Linger keeps
-the user's systemd manager running after logout and starts it at boot. The API
+`rchia`'s systemd manager running after logout and starts it at boot. The API
 can start before Qwen has finished loading; `/models` will show Qwen as
-unreachable until the model is ready. These commands assume the repository
-path has no spaces. If you move the repository or replace the `.sif`, update
-the paths in the unit files and reload systemd.
+unreachable until the model is ready. If you move `rayban-vlm` or replace the
+`.sif`, update the paths in the unit files as `rchia` and reload systemd.
 
 This configuration binds both ports to `127.0.0.1`; the phone reaches the API
 through Tailscale Serve. For direct LAN access, change `GB10_HOST` in the API
 unit to `0.0.0.0` and restrict access to a trusted network.
 
-Check status, logs, and both endpoints:
+Back in the `rchia` account, check status, logs, and both endpoints:
 
 ```bash
 systemctl --user status gb10-qwen.service gb10-api.service
@@ -160,9 +167,9 @@ other services that need to run after logout.
 ### Tailscale HTTPS name
 
 If port `9443` is not already mapped to the GB10 API, configure Tailscale
-Serve on the GB10. This mapping persists in Tailscale's configuration; it does
-not need a separate systemd unit. The phone must be connected to the same
-tailnet and allowed by its access rules.
+Serve from the **admin account** on the GB10. This mapping persists in
+Tailscale's configuration; it does not need a separate systemd unit. The
+phone must be connected to the same tailnet and allowed by its access rules.
 
 ```bash
 tailscale serve status
@@ -178,13 +185,62 @@ mapping, run `sudo tailscale serve --https=9443 off`. Do not use
 this GB10. Use Serve, not Funnel, so this unauthenticated API remains inside
 the tailnet. [Tailscale Serve CLI](https://tailscale.com/docs/reference/tailscale-cli/serve)
 
+If the Android app reports HTTP 404, check the exact **Host URL** entered in
+the app. It must be the base URL above, with no `/v1`, `/health`, or other
+path. The app requests `/health` and `/models` itself. Then, on the GB10, run:
+
+```bash
+curl -i http://127.0.0.1:8765/health
+curl -i http://127.0.0.1:8765/models
+curl -i https://promaxgb10-4e2b.tail06a565.ts.net:9443/health
+curl -i https://promaxgb10-4e2b.tail06a565.ts.net:9443/models
+sudo tailscale serve status
+```
+
+Both health requests should return HTTP 200 with
+`"service": "gb10-local-host"`; both model requests should return a JSON
+`models` list. If the local requests work but the HTTPS requests return 404,
+port `9443` is reaching a different service or path.
+If this port is dedicated to the GB10 API, configure it from the admin
+account with:
+
+```bash
+sudo tailscale serve --bg --https=9443 http://127.0.0.1:8765
+```
+
+Then recheck. If the local request also fails, check
+`systemctl --user status gb10-api.service` and
+`journalctl --user -u gb10-api.service -n 50` in the `rchia` account. This
+`mock_server.py` returns `{"error": "Unknown endpoint: ..."}` for unknown
+routes; a `{"detail": "Not Found"}` response comes from another server.
+
 ## Endpoints
 
 - `GET /health`
 - `GET /models`
 - `POST /analyze_image`
+- `POST /analyze_clip`
 - `GET /experiment_runs`
 - `GET /export`
+
+`POST /analyze_clip` accepts a silent, H.264 MP4 clip (about two seconds)
+as `video_base64` with `video_mime_type: "video/mp4"`. Include the same
+`session_id`, `task_type`, `prompt`, `selected_agent_profile`, and optional
+`voice_transcript` as image analysis. Its `capture_metadata` must contain
+`source`, `captured_at_ms`, `mode: "short_clip"`, `duration_ms` (500–3000),
+and `frame_count` (2–120). The decoded clip must be at most 8 MB. This route
+requires the enabled Qwen vLLM profile and returns the existing normalized
+result format. Model failures return HTTP 502; they do not produce a mock
+answer. Clip bytes are not saved to the experiment log.
+
+After copying the updated `mock_server.py` into
+`/home/rchia/projects/rayban-vlm/`, restart its user service from the `rchia`
+account with `systemctl --user restart gb10-api.service`. The Android app
+must also be rebuilt and installed to show the new clip controls. The
+current Qwen vLLM image must support native `video_url` MP4 input; test a
+clip on the GB10 before using it with the glasses.
+Check `curl http://127.0.0.1:8765/health` for `"clip_enabled": true` to
+confirm the new API version is running.
 
 The implementation does not store raw audio. It stores experiment run records on disk as JSONL, including the optional `voice_transcript` sent by the Android app. Raw images are not stored unless explicitly enabled.
 
@@ -308,7 +364,7 @@ Default Qwen configuration:
 ```text
 GB10_ENABLE_QWEN=1
 QWEN_BASE_URL=http://127.0.0.1:8001/v1
-QWEN_MODEL=Qwen/Qwen2.5-VL-7B-Instruct
+QWEN_MODEL=Qwen/Qwen3-VL-8B-Instruct
 QWEN_TIMEOUT_SECONDS=120
 QWEN_MAX_TOKENS=512
 ```
@@ -341,4 +397,5 @@ $env:QWEN_API_KEY='<local-token>'
 python .\gb10-host\mock_server.py
 ```
 
-`GET /models` reports each profile status separately. `POST /analyze_image` runs only the requested `selected_agent_profile`.
+`GET /models` reports each profile status separately. `POST /analyze_image` and
+`POST /analyze_clip` run only the requested `selected_agent_profile`.

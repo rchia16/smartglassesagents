@@ -8,8 +8,12 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.os.SystemClock
 import android.util.Log
 import androidx.exifinterface.media.ExifInterface
+import com.example.smartglassesagents.capture.CapturedClip
+import com.example.smartglassesagents.capture.ShortClipEncoder
+import com.example.smartglassesagents.experiment.CaptureSource
 import com.meta.wearable.dat.camera.Camera
 import com.meta.wearable.dat.camera.Stream
 import com.meta.wearable.dat.camera.addCamera
@@ -31,6 +35,7 @@ import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
@@ -72,6 +77,7 @@ class RealDatSessionController(
     private var camera: Camera? = null
     private var stream: Stream? = null
     private var latestFrame: Bitmap? = null
+    @Volatile private var latestFrameSequence = 0L
     private var registrationJob: Job? = null
     private var registrationErrorJob: Job? = null
     private var deviceJob: Job? = null
@@ -307,6 +313,25 @@ class RealDatSessionController(
         return photoData.toBitmap().also { latestFrame = it }
     }
 
+    override suspend fun captureClip(cacheDir: File): CapturedClip? {
+        check(_state.value.isReadyForCapture) { "Start a DAT stream session before recording a clip." }
+        val capturedAtMs = System.currentTimeMillis()
+        val frames = mutableListOf<Bitmap>()
+        var seenSequence = latestFrameSequence
+        val endAt = SystemClock.elapsedRealtime() + 2_000L
+        while (SystemClock.elapsedRealtime() < endAt) {
+            check(_state.value.isReadyForCapture) { "DAT stream stopped during clip capture." }
+            val sequence = latestFrameSequence
+            val frame = latestFrame
+            if (sequence != seenSequence && frame != null) {
+                frames.add(frame)
+                seenSequence = sequence
+            }
+            delay(100)
+        }
+        return ShortClipEncoder.encode(cacheDir, frames, CaptureSource.RayBanMetaDat, capturedAtMs)
+    }
+
     private fun startStreamSession() {
         coroutineScope.launch {
             stopSessionForRestart()
@@ -476,6 +501,7 @@ class RealDatSessionController(
             videoJob = coroutineScope.launch {
                 createdStream.videoStream.collect { frame: VideoFrame ->
                     latestFrame = frame.toBitmap()
+                    latestFrameSequence++
                 }
             }
 

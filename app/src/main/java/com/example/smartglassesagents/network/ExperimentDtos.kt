@@ -47,6 +47,34 @@ data class AnalyzeImageRequest(
     }
 }
 
+data class AnalyzeClipRequest(
+    val sessionId: String,
+    val taskType: TaskType,
+    val prompt: String,
+    val voiceTranscript: String,
+    val selectedAgentProfile: String,
+    val videoBase64: String,
+    val captureSource: CaptureSource,
+    val capturedAtMs: Long,
+    val durationMs: Long,
+    val frameCount: Int
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("session_id", sessionId)
+        .put("task_type", taskType.wireName)
+        .put("prompt", prompt)
+        .put("voice_transcript", voiceTranscript.trim())
+        .put("selected_agent_profile", selectedAgentProfile)
+        .put("video_base64", videoBase64)
+        .put("video_mime_type", "video/mp4")
+        .put("capture_metadata", JSONObject()
+            .put("source", captureSource.wireName)
+            .put("captured_at_ms", capturedAtMs)
+            .put("mode", "short_clip")
+            .put("duration_ms", durationMs)
+            .put("frame_count", frameCount))
+}
+
 data class AnalyzeImageResponse(
     val runId: String,
     val taskType: TaskType,

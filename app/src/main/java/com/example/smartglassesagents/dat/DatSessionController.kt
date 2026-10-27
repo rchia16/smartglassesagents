@@ -1,6 +1,8 @@
 package com.example.smartglassesagents.dat
 
 import android.graphics.Bitmap
+import com.example.smartglassesagents.capture.CapturedClip
+import java.io.File
 import kotlinx.coroutines.flow.StateFlow
 
 interface DatSessionController {
@@ -14,4 +16,5 @@ interface DatSessionController {
     fun startSession()
     fun stopSession()
     suspend fun captureFrame(): Bitmap?
+    suspend fun captureClip(cacheDir: File): CapturedClip?
 }

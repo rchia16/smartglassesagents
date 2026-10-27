@@ -4,12 +4,17 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import com.example.smartglassesagents.capture.CapturedClip
+import com.example.smartglassesagents.capture.ShortClipEncoder
+import com.example.smartglassesagents.experiment.CaptureSource
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.io.File
 
 class MockDatSessionController : DatSessionController {
     private val _state = MutableStateFlow(DatDeviceState())
@@ -87,6 +92,22 @@ class MockDatSessionController : DatSessionController {
             return null
         }
         return createMockFrame()
+    }
+
+    override suspend fun captureClip(cacheDir: File): CapturedClip? {
+        check(_state.value.isReadyForCapture) { "Start a mock DAT session before recording a clip." }
+        val capturedAtMs = System.currentTimeMillis()
+        val frames = mutableListOf<Bitmap>()
+        repeat(20) {
+            check(_state.value.isReadyForCapture) { "Mock DAT session stopped during clip capture." }
+            frames.add(createMockFrame())
+            delay(100)
+        }
+        return try {
+            ShortClipEncoder.encode(cacheDir, frames, CaptureSource.Mock, capturedAtMs)
+        } finally {
+            frames.forEach(Bitmap::recycle)
+        }
     }
 
     private fun setError(message: String) {

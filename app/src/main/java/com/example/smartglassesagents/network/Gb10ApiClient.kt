@@ -30,6 +30,15 @@ class Gb10ApiClient(private val hostConfig: HostConfig) {
             }
         }
 
+    suspend fun analyzeClip(request: AnalyzeClipRequest): Result<AnalyzeImageResponse> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                AnalyzeImageResponse.fromJson(
+                    requestJson("/analyze_clip", "POST", request.toJson(), 150_000)
+                )
+            }
+        }
+
     suspend fun getModels(): Result<List<ModelProfile>> = withContext(Dispatchers.IO) {
         runCatching {
             val json = requestJson(path = "/models", method = "GET")
@@ -42,12 +51,14 @@ class Gb10ApiClient(private val hostConfig: HostConfig) {
         }
     }
 
-    private fun requestJson(path: String, method: String, body: JSONObject? = null): JSONObject {
+    private fun requestJson(
+        path: String, method: String, body: JSONObject? = null, readTimeoutMs: Int = 30_000
+    ): JSONObject {
         val normalizedBase = hostConfig.baseUrl.trim().trimEnd('/')
         val connection = (URL("$normalizedBase$path").openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 15_000
-            readTimeout = 30_000
+            readTimeout = readTimeoutMs
             setRequestProperty("Accept", "application/json")
             if (hostConfig.pairingToken.isNotBlank()) {
                 setRequestProperty("Authorization", "Bearer ${hostConfig.pairingToken}")

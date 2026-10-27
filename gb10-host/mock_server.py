@@ -17,6 +17,8 @@ It intentionally uses only the Python standard library.
 from __future__ import annotations
 
 import csv
+import base64
+import binascii
 import io
 import json
 import os
@@ -94,7 +96,7 @@ VLLM_TEMPERATURE = float(first_env(("VLLM_TEMPERATURE", "NEMOTRON_TEMPERATURE"),
 ENABLE_QWEN = env_bool(("GB10_ENABLE_QWEN", "ENABLE_QWEN"), "1")
 QWEN_BASE_URL = first_env(("QWEN_BASE_URL",), "http://127.0.0.1:8001/v1").rstrip("/")
 QWEN_HEALTH_URL = first_env(("QWEN_HEALTH_URL",), default_vllm_health_url(QWEN_BASE_URL)).rstrip("/")
-QWEN_MODEL = first_env(("QWEN_MODEL", "QWEN_MODEL_ID"), "Qwen/Qwen2.5-VL-7B-Instruct")
+QWEN_MODEL = first_env(("QWEN_MODEL", "QWEN_MODEL_ID"), "Qwen/Qwen3-VL-8B-Instruct")
 QWEN_AGENT_PROFILE = first_env(("QWEN_AGENT_PROFILE",), "local_qwen_detail")
 QWEN_API_KEY = first_env(("QWEN_API_KEY",), VLLM_API_KEY)
 QWEN_TIMEOUT_SECONDS = float(first_env(("QWEN_TIMEOUT_SECONDS",), str(VLLM_TIMEOUT_SECONDS)))
@@ -107,6 +109,8 @@ STORE_RAW_IMAGES = env_bool(("GB10_STORE_RAW_IMAGES",), "0")
 RAW_IMAGE_DIR = Path(os.environ.get("GB10_RAW_IMAGE_DIR", DATA_DIR / "raw_images"))
 
 PROMPT_VERSION = "local-vlm-v1"
+MAX_CLIP_BYTES = 8_000_000
+MAX_CLIP_REQUEST_BYTES = 11_000_000
 RUNS: list[dict[str, Any]] = []
 
 AGENT_PROFILES: list[dict[str, str]] = []
@@ -157,13 +161,13 @@ if ENABLE_QWEN:
             "timeout_seconds": str(QWEN_TIMEOUT_SECONDS),
             "max_tokens": str(QWEN_MAX_TOKENS),
             "temperature": str(QWEN_TEMPERATURE),
-            "purpose": "Qwen2.5-VL detail benchmark alternative",
+            "purpose": "Qwen VL detail and short-video analysis",
         }
     )
 
 
 class Gb10Handler(BaseHTTPRequestHandler):
-    server_version = "GB10Host/0.5"
+    server_version = "GB10Host/0.6"
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -172,6 +176,7 @@ class Gb10Handler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "service": "gb10-local-host",
+                    "clip_enabled": True,
                     "ollama_enabled": ENABLE_OLLAMA,
                     "ollama_base_url": OLLAMA_BASE_URL,
                     "ollama_reachable": ollama_is_reachable() if ENABLE_OLLAMA else False,
@@ -204,11 +209,16 @@ class Gb10Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/analyze_clip":
+            self._analyze_clip()
+            return
         if path != "/analyze_image":
             self._send_json({"error": f"Unknown endpoint: {path}"}, status=404)
             return
 
         body = self._read_json()
+        if body is None:
+            return
         task_type = body.get("task_type", "general_query")
         prompt = body.get("prompt", "")
         voice_transcript = str(body.get("voice_transcript", "")).strip()
@@ -274,19 +284,116 @@ class Gb10Handler(BaseHTTPRequestHandler):
 
         self._send_json(response)
 
+    def _analyze_clip(self) -> None:
+        body = self._read_json(max_bytes=MAX_CLIP_REQUEST_BYTES)
+        if body is None:
+            return
+        try:
+            clip_bytes, metadata = validate_clip_request(body)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+
+        requested_profile = str(body.get("selected_agent_profile", "")).strip()
+        profile = resolve_agent_profile(requested_profile) if requested_profile else None
+        if profile is None or profile.get("runtime") != "vllm" or "qwen" not in profile.get("model_id", "").lower():
+            self._send_json({"error": "Clip analysis requires an enabled Qwen vLLM profile"}, status=400)
+            return
+
+        task_type = str(body.get("task_type", "general_query"))
+        user_prompt = str(body.get("prompt", ""))
+        voice_transcript = str(body.get("voice_transcript", "")).strip()
+        prompt = build_prompt(
+            profile["agent_profile"], task_type, user_prompt, voice_transcript,
+            str(metadata.get("source", "unknown")),
+        ) + " Analyze the two-second video in temporal order. Describe changes only when visible."
+        started = time.perf_counter()
+        try:
+            answer = vllm_generate_video(profile, prompt, base64.b64encode(clip_bytes).decode("ascii"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(300).decode("utf-8", errors="replace")
+            self._send_json({"error": f"Qwen video request failed (HTTP {exc.code}): {detail}"}, status=502)
+            return
+        except Exception as exc:
+            self._send_json({"error": f"Clip inference failed: {type(exc).__name__}: {exc}"[:300]}, status=502)
+            return
+
+        run_id = str(uuid.uuid4())
+        result = {
+            "agent_profile": profile["agent_profile"],
+            "model_id": profile["model_id"],
+            "runtime": "vllm",
+            "prompt_version": PROMPT_VERSION,
+            "answer": answer,
+            "observations": extract_observations(answer),
+            "locations": [],
+            "confidence": 0.65,
+            "uncertainties": task_uncertainties(task_type, used_fallback=False),
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
+        response = {
+            "run_id": run_id,
+            "task_type": task_type,
+            "selected_speech_agent": profile["agent_profile"],
+            "results": [result],
+            "speech_text": make_speech_text(result, task_type),
+        }
+        append_run_record({
+            "run_id": run_id,
+            "session_id": str(body.get("session_id", "")),
+            "task_type": task_type,
+            "prompt": user_prompt,
+            "voice_transcript": voice_transcript,
+            "capture_source": metadata.get("source", "unknown"),
+            "captured_at_ms": metadata.get("captured_at_ms"),
+            "capture_mode": "short_clip",
+            "duration_ms": metadata["duration_ms"],
+            "frame_count": metadata["frame_count"],
+            "video_mime_type": "video/mp4",
+            "video_bytes": len(clip_bytes),
+            "raw_video_stored": False,
+            "requested_agent_profile": profile["agent_profile"],
+            "selected_speech_agent": profile["agent_profile"],
+            "model_id": profile["model_id"],
+            "runtime": "vllm",
+            "prompt_version": PROMPT_VERSION,
+            "latency_ms": result["latency_ms"],
+            "confidence": result["confidence"],
+            "speech_text": response["speech_text"],
+            "result": result,
+            "response": response,
+            "created_at_ms": int(time.time() * 1000),
+        })
+        self._send_json(response)
+
     def log_message(self, format: str, *args: Any) -> None:
         print(f"{self.address_string()} - {format % args}")
 
-    def _read_json(self) -> dict[str, Any]:
-        content_length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(content_length).decode("utf-8")
-        if not raw_body:
-            return {}
+    def _read_json(self, max_bytes: int | None = None) -> dict[str, Any] | None:
         try:
-            return json.loads(raw_body)
-        except json.JSONDecodeError as exc:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json({"error": "Invalid Content-Length"}, status=400)
+            return None
+        if content_length < 0 or (max_bytes is not None and content_length > max_bytes):
+            self._send_json({"error": "Clip request is too large"}, status=413)
+            return None
+        try:
+            raw_body = self.rfile.read(content_length).decode("utf-8")
+        except UnicodeDecodeError:
+            self._send_json({"error": "JSON body must be UTF-8"}, status=400)
+            return None
+        if not raw_body:
+            self._send_json({"error": "JSON request body is required"}, status=400)
+            return None
+        try:
+            body = json.loads(raw_body)
+            if not isinstance(body, dict):
+                raise ValueError("JSON object is required")
+            return body
+        except (json.JSONDecodeError, ValueError) as exc:
             self._send_json({"error": f"Invalid JSON: {exc}"}, status=400)
-            return {}
+            return None
 
     def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         encoded = json.dumps(payload).encode("utf-8")
@@ -308,6 +415,11 @@ class Gb10Handler(BaseHTTPRequestHandler):
             "sample_index",
             "voice_transcript",
             "image_bytes_base64",
+            "video_bytes",
+            "duration_ms",
+            "frame_count",
+            "video_mime_type",
+            "raw_video_stored",
             "raw_image_stored",
             "raw_image_path",
             "requested_agent_profile",
@@ -331,6 +443,75 @@ class Gb10Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+
+def validate_clip_request(body: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    if body.get("video_mime_type") != "video/mp4":
+        raise ValueError("video_mime_type must be video/mp4")
+    encoded = body.get("video_base64")
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError("video_base64 is required")
+    if len(encoded) > (MAX_CLIP_BYTES + 2) * 4 // 3 + 4:
+        raise ValueError("Clip exceeds 8 MB")
+    try:
+        video = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("video_base64 is invalid") from exc
+    if len(video) > MAX_CLIP_BYTES:
+        raise ValueError("Clip exceeds 8 MB")
+    if len(video) < 12 or video[4:8] != b"ftyp":
+        raise ValueError("Clip must be an MP4 file")
+    metadata = body.get("capture_metadata")
+    if not isinstance(metadata, dict) or metadata.get("mode") != "short_clip":
+        raise ValueError("capture_metadata.mode must be short_clip")
+    duration = metadata.get("duration_ms")
+    frame_count = metadata.get("frame_count")
+    if isinstance(duration, bool) or not isinstance(duration, int) or not 500 <= duration <= 3000:
+        raise ValueError("duration_ms must be between 500 and 3000")
+    if isinstance(frame_count, bool) or not isinstance(frame_count, int) or not 2 <= frame_count <= 120:
+        raise ValueError("frame_count must be between 2 and 120")
+    actual_duration = mp4_duration_ms(video)
+    if actual_duration is None or not 500 <= actual_duration <= 3000:
+        raise ValueError("MP4 duration must be between 500 and 3000 ms")
+    return video, {**metadata, "duration_ms": actual_duration}
+
+
+def mp4_duration_ms(video: bytes) -> int | None:
+    def boxes(start: int, end: int):
+        position = start
+        while position + 8 <= end:
+            size = int.from_bytes(video[position:position + 4], "big")
+            kind = video[position + 4:position + 8]
+            header = 8
+            if size == 1:
+                if position + 16 > end:
+                    return
+                size = int.from_bytes(video[position + 8:position + 16], "big")
+                header = 16
+            elif size == 0:
+                size = end - position
+            if size < header or position + size > end:
+                return
+            yield kind, position + header, position + size
+            position += size
+
+    for kind, start, end in boxes(0, len(video)):
+        if kind != b"moov":
+            continue
+        for child_kind, child_start, child_end in boxes(start, end):
+            if child_kind != b"mvhd" or child_start + 20 > child_end:
+                continue
+            version = video[child_start]
+            if version == 0:
+                timescale = int.from_bytes(video[child_start + 12:child_start + 16], "big")
+                duration = int.from_bytes(video[child_start + 16:child_start + 20], "big")
+            elif version == 1 and child_start + 32 <= child_end:
+                timescale = int.from_bytes(video[child_start + 20:child_start + 24], "big")
+                duration = int.from_bytes(video[child_start + 24:child_start + 32], "big")
+            else:
+                return None
+            return duration * 1000 // timescale if timescale else None
+    return None
 
 
 def run_agent_profile(
@@ -612,6 +793,35 @@ def vllm_generate(profile: dict[str, str], prompt: str, image_base64: str) -> st
     answer = extract_chat_message_text(message.get("content", ""))
     if not answer:
         raise RuntimeError(f"vLLM model {profile['model_id']} returned an empty response")
+    return answer
+
+
+def vllm_generate_video(profile: dict[str, str], prompt: str, video_base64: str) -> str:
+    payload = {
+        "model": profile["model_id"],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "video_url", "video_url": {
+                    "url": f"data:video/mp4;base64,{video_base64}"
+                }},
+            ],
+        }],
+        "temperature": float(profile.get("temperature", VLLM_TEMPERATURE)),
+        "max_tokens": int(float(profile.get("max_tokens", VLLM_MAX_TOKENS))),
+        "stream": False,
+    }
+    response = vllm_request(
+        f"{profile['base_url']}/chat/completions",
+        payload=payload,
+        timeout=float(profile.get("timeout_seconds", VLLM_TIMEOUT_SECONDS)),
+        api_key=profile.get("api_key", ""),
+    )
+    choices = response.get("choices", [])
+    answer = extract_chat_message_text(choices[0].get("message", {}).get("content", "")) if choices else ""
+    if not answer:
+        raise RuntimeError(f"vLLM model {profile['model_id']} returned no video answer")
     return answer
 
 
