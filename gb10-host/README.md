@@ -12,7 +12,13 @@ It supports Ollama profiles plus OpenAI-compatible vLLM profiles for Nemotron an
 python .\gb10-host\mock_server.py
 ```
 
-The server listens on `0.0.0.0:8765`.
+The server listens on `0.0.0.0:8765` by default.
+
+On the GB10 (Linux), run it from this directory with:
+
+```bash
+apptainer exec ~/containers/vllm.sif python mock_server.py
+```
 
 For the Android emulator, use:
 
@@ -26,7 +32,7 @@ For a physical phone on the same network, use the GB10 machine's LAN IP:
 http://<gb10-lan-ip>:8765
 ```
 
-Do not use `10.0.2.2` from a physical phone. That address is an Android emulator alias for the host machine. On a real phone, check the GB10/desktop Wi-Fi IPv4 address with:
+Do not use `10.0.2.2` from a physical phone. That address is an Android emulator alias for the host machine. On the Linux GB10, check its LAN address with `hostname -I`. On a Windows host, use:
 
 ```powershell
 ipconfig
@@ -37,6 +43,140 @@ Then enter that address in the app, for example:
 ```text
 http://192.168.0.194:8765
 ```
+
+If Tailscale Serve is configured as described below, a phone connected to the
+same tailnet can instead enter this HTTPS base URL in the app:
+
+```text
+https://promaxgb10-4e2b.tail06a565.ts.net:9443
+```
+
+The app appends `/health`, `/models`, and other API paths, so enter the base URL
+without `/health` or `/v1`. Confirm the URL serves this API with
+`curl https://promaxgb10-4e2b.tail06a565.ts.net:9443/health`.
+
+## Keep Qwen and the API running on the GB10 (systemd)
+
+These **user services** reproduce the working Apptainer commands. Run the
+following on the GB10 as the Linux user who owns `~/containers/vllm.sif` and
+the model cache. Run it from the repository's `gb10-host` directory. The
+container must already provide `fix-nvidia-libpath` and
+`start-vllm-qwen25-vl`, as in the image used for the working manual command.
+The checked-in `vllm.def` currently defines a differently named Qwen helper,
+so building that file as-is does not provide these two commands.
+
+```bash
+cd /path/to/SmartGlassesAgents/gb10-host
+GB10_REPO_DIR="$(pwd -P)"
+GB10_APPTAINER="$(command -v apptainer)"
+test -f "$HOME/containers/vllm.sif"
+test -f "$GB10_REPO_DIR/mock_server.py"
+mkdir -p "$HOME/.config/systemd/user"
+
+cat > "$HOME/.config/systemd/user/gb10-qwen.service" <<EOF
+[Unit]
+Description=GB10 Qwen3 VL vLLM server
+
+[Service]
+Type=simple
+ExecStart=$GB10_APPTAINER exec --nv --bind $HOME:$HOME --env VLLM_PORT=8001 --env VLLM_HOST=127.0.0.1 --env MODEL_ID=Qwen/Qwen3-VL-8B-Instruct --env VLLM_MAX_MODEL_LEN=8192 --env VLLM_GPU_MEMORY_UTILIZATION=0.50 $HOME/containers/vllm.sif fix-nvidia-libpath start-vllm-qwen25-vl
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+cat > "$HOME/.config/systemd/user/gb10-api.service" <<EOF
+[Unit]
+Description=GB10 Smart Glasses Agents API
+Wants=gb10-qwen.service
+After=gb10-qwen.service
+
+[Service]
+Type=simple
+WorkingDirectory=$GB10_REPO_DIR
+ExecStart=$GB10_APPTAINER exec --bind $GB10_REPO_DIR:$GB10_REPO_DIR --env GB10_HOST=127.0.0.1 --env GB10_ENABLE_OLLAMA=0 --env GB10_ENABLE_VLLM=0 --env GB10_ENABLE_QWEN=1 --env QWEN_BASE_URL=http://127.0.0.1:8001/v1 --env QWEN_MODEL=Qwen/Qwen3-VL-8B-Instruct $HOME/containers/vllm.sif python mock_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now gb10-qwen.service gb10-api.service
+sudo loginctl enable-linger "$(id -un)"
+```
+
+`enable --now` starts both services and enables them at login. Linger keeps
+the user's systemd manager running after logout and starts it at boot. The API
+can start before Qwen has finished loading; `/models` will show Qwen as
+unreachable until the model is ready. These commands assume the repository
+path has no spaces. If you move the repository or replace the `.sif`, update
+the paths in the unit files and reload systemd.
+
+This configuration binds both ports to `127.0.0.1`; the phone reaches the API
+through Tailscale Serve. For direct LAN access, change `GB10_HOST` in the API
+unit to `0.0.0.0` and restrict access to a trusted network.
+
+Check status, logs, and both endpoints:
+
+```bash
+systemctl --user status gb10-qwen.service gb10-api.service
+journalctl --user -u gb10-qwen.service -u gb10-api.service -f
+curl -f http://127.0.0.1:8001/health
+curl -f http://127.0.0.1:8765/health
+curl -s http://127.0.0.1:8765/models
+```
+
+To stop now but keep the boot configuration, use:
+
+```bash
+systemctl --user stop gb10-api.service gb10-qwen.service
+```
+
+To disable both at boot and stop them now, use:
+
+```bash
+systemctl --user disable --now gb10-api.service gb10-qwen.service
+```
+
+To restart after changing settings or replacing the container, and to clear
+a failed/start-limit state if needed:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user reset-failed gb10-qwen.service gb10-api.service
+systemctl --user restart gb10-qwen.service gb10-api.service
+```
+
+`reset-failed` clears systemd's failure counter; it does not erase model
+caches or experiment runs. To remove these services entirely, disable and stop
+them, delete the two files under `~/.config/systemd/user/`, then run
+`systemctl --user daemon-reload`. Only disable linger if this user has no
+other services that need to run after logout.
+
+### Tailscale HTTPS name
+
+If port `9443` is not already mapped to the GB10 API, configure Tailscale
+Serve on the GB10. This mapping persists in Tailscale's configuration; it does
+not need a separate systemd unit. The phone must be connected to the same
+tailnet and allowed by its access rules.
+
+```bash
+tailscale serve status
+sudo tailscale serve --bg --https=9443 http://127.0.0.1:8765
+tailscale serve status
+curl -f https://promaxgb10-4e2b.tail06a565.ts.net:9443/health
+```
+
+If `tailscale serve status` already shows port `9443` forwarding to
+`http://127.0.0.1:8765`, keep the existing mapping. To remove only this
+mapping, run `sudo tailscale serve --https=9443 off`. Do not use
+`tailscale serve reset` unless you intend to remove every Serve mapping on
+this GB10. Use Serve, not Funnel, so this unauthenticated API remains inside
+the tailnet. [Tailscale Serve CLI](https://tailscale.com/docs/reference/tailscale-cli/serve)
 
 ## Endpoints
 
@@ -168,7 +308,7 @@ Default Qwen configuration:
 ```text
 GB10_ENABLE_QWEN=1
 QWEN_BASE_URL=http://127.0.0.1:8001/v1
-QWEN_MODEL=Qwen/Qwen2.5-VL-72B-Instruct
+QWEN_MODEL=Qwen/Qwen2.5-VL-7B-Instruct
 QWEN_TIMEOUT_SECONDS=120
 QWEN_MAX_TOKENS=512
 ```
@@ -182,7 +322,7 @@ $env:GB10_ENABLE_OLLAMA='0'
 $env:GB10_ENABLE_VLLM='0'
 $env:GB10_ENABLE_QWEN='1'
 $env:QWEN_BASE_URL='http://127.0.0.1:8001/v1'
-$env:QWEN_MODEL='Qwen/Qwen2.5-VL-72B-Instruct'
+$env:QWEN_MODEL='Qwen/Qwen3-VL-8B-Instruct'
 python .\gb10-host\mock_server.py
 ```
 

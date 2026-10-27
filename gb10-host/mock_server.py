@@ -502,6 +502,13 @@ def build_prompt(
         "For faces, only count, locate, and give non-identifying visible descriptions. "
         "For spatial descriptions, use image-left and image-right as seen in the image. "
         "Do not swap left and right to infer the wearer's body-relative perspective."
+        "Answer the user's visual question concisely and concentrated around"
+        "spatial information that is helpful for orientation, mobility and"
+        "spatial understanding for someone that suffers from blindness or"
+        "low vision. The user is wearing a glasses that takes photos so answer"
+        "in a egocentric way. Keep a running memory so I can recall what I have"
+        "seen. Reduce redundant information. I already have context. if I ask"
+        "for something and it is not available, prompt me to survey my surroundings."
     )
     capture_note = ""
     if capture_source == "rayban_meta_dat":

@@ -45,3 +45,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Smart Glasses Agents"
 include(":app")
+include(":fastvlm_assets")

@@ -58,7 +58,6 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.smartglassesagents.BuildConfig
-import com.example.smartglassesagents.capture.toJpegBase64
 import com.example.smartglassesagents.dat.DatDeviceState
 import com.example.smartglassesagents.dat.DatPermissionBridge
 import com.example.smartglassesagents.dat.NoOpDatPermissionBridge
@@ -67,10 +66,10 @@ import com.example.smartglassesagents.experiment.CaptureSource
 import com.example.smartglassesagents.experiment.ExperimentStatus
 import com.example.smartglassesagents.experiment.HostConfig
 import com.example.smartglassesagents.experiment.TaskType
+import com.example.smartglassesagents.inference.createImageAnalyzer
 import com.example.smartglassesagents.network.AgentResult
 import com.example.smartglassesagents.network.AnalyzeImageRequest
 import com.example.smartglassesagents.network.AnalyzeImageResponse
-import com.example.smartglassesagents.network.Gb10ApiClient
 import com.example.smartglassesagents.network.ModelProfile
 import com.example.smartglassesagents.speech.AudioRouteController
 import com.example.smartglassesagents.speech.AudioRouteState
@@ -113,6 +112,12 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
     var pairingToken by remember {
         mutableStateOf(settings.getString(SETTINGS_PAIRING_TOKEN, "") ?: "")
     }
+    val imageAnalyzer = remember(context, hostUrl, pairingToken) {
+        createImageAnalyzer(
+            context = context,
+            hostConfig = HostConfig(baseUrl = hostUrl, pairingToken = pairingToken)
+        )
+    }
     var selectedTask by remember { mutableStateOf(TaskType.BoardText) }
     var prompt by remember { mutableStateOf(TaskType.BoardText.defaultPrompt) }
     var availableModels by remember { mutableStateOf<List<ModelProfile>>(emptyList()) }
@@ -145,6 +150,10 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
             liveSamplingJob?.cancel()
             speechController.shutdown()
         }
+    }
+
+    DisposableEffect(imageAnalyzer) {
+        onDispose { imageAnalyzer.close() }
     }
 
     LaunchedEffect(hostUrl, pairingToken) {
@@ -267,10 +276,6 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
         }
     }
 
-    fun client(): Gb10ApiClient = Gb10ApiClient(
-        HostConfig(baseUrl = hostUrl, pairingToken = pairingToken)
-    )
-
     fun syncSelectedModel(models: List<ModelProfile>) {
         availableModels = models
         if (models.isEmpty()) {
@@ -283,7 +288,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
     }
 
     LaunchedEffect(Unit) {
-        client().getModels()
+        imageAnalyzer.getModels()
             .onSuccess { models ->
                 syncSelectedModel(models)
                 status = ExperimentStatus.Ready("Loaded ${models.size} model profile(s).")
@@ -312,14 +317,14 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
             prompt = prompt,
             voiceTranscript = voiceTranscript,
             selectedAgentProfile = selectedAgentProfile,
-            imageBase64 = bitmap.toJpegBase64(),
+            imageBase64 = "",
             imageMimeType = "image/jpeg",
             captureSource = source,
             capturedAtMs = System.currentTimeMillis(),
             liveSample = liveSample,
             sampleIndex = sampleIndex
         )
-        client().analyzeImage(request)
+        imageAnalyzer.analyzeImage(request, bitmap)
             .onSuccess { response ->
                 latestResponse = response
                 status = if (liveSample) {
@@ -336,7 +341,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                         }
                     } else {
                         lastSpokenLiveText = ""
-                        speak(response.fullReadoutText())
+                        speak(response.spokenText())
                     }
                 }
             }
@@ -345,7 +350,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
             }
     }
 
-    fun currentLiveFrame(): Pair<Bitmap, CaptureSource>? {
+    suspend fun currentLiveFrame(): Pair<Bitmap, CaptureSource>? {
         if (datController.state.value.isReadyForCapture) {
             datController.captureFrame()?.let {
                 val source = if (datController.state.value.supportsRealSdk) {
@@ -425,29 +430,53 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
         ) {
             Header(status = status)
 
-            ConnectionPanel(
-                hostUrl = hostUrl,
-                pairingToken = pairingToken,
-                onHostUrlChanged = { hostUrl = it },
-                onPairingTokenChanged = { pairingToken = it },
-                onCheckHost = {
-                    status = ExperimentStatus.CheckingHost
-                    coroutineScope.launch {
-                        client().checkHealth()
-                            .onSuccess {
-                                client().getModels()
-                                    .onSuccess { models ->
-                                        syncSelectedModel(models)
-                                        status = ExperimentStatus.Ready("GB10 host is $it. Loaded ${models.size} model profile(s).")
-                                    }
-                                    .onFailure { error ->
-                                        status = ExperimentStatus.Error(error.message ?: "Model list failed.")
-                                    }
-                            }
-                            .onFailure { status = ExperimentStatus.Error(it.message ?: "Host check failed.") }
+            if (BuildConfig.INFERENCE_MODE == "phone_local") {
+                LocalModelPanel(
+                    onCheckModel = {
+                        status = ExperimentStatus.CheckingHost
+                        coroutineScope.launch {
+                            imageAnalyzer.checkAvailability()
+                                .onSuccess { message ->
+                                    imageAnalyzer.getModels()
+                                        .onSuccess { models ->
+                                            syncSelectedModel(models)
+                                            status = ExperimentStatus.Ready(message)
+                                        }
+                                        .onFailure { error ->
+                                            status = ExperimentStatus.Error(error.message ?: "Local model check failed.")
+                                        }
+                                }
+                                .onFailure { error ->
+                                    status = ExperimentStatus.Error(error.message ?: "Local model check failed.")
+                                }
+                        }
                     }
-                }
-            )
+                )
+            } else {
+                ConnectionPanel(
+                    hostUrl = hostUrl,
+                    pairingToken = pairingToken,
+                    onHostUrlChanged = { hostUrl = it },
+                    onPairingTokenChanged = { pairingToken = it },
+                    onCheckHost = {
+                        status = ExperimentStatus.CheckingHost
+                        coroutineScope.launch {
+                            imageAnalyzer.checkAvailability()
+                                .onSuccess {
+                                    imageAnalyzer.getModels()
+                                        .onSuccess { models ->
+                                            syncSelectedModel(models)
+                                            status = ExperimentStatus.Ready("GB10 host is $it. Loaded ${models.size} model profile(s).")
+                                        }
+                                        .onFailure { error ->
+                                            status = ExperimentStatus.Error(error.message ?: "Model list failed.")
+                                        }
+                                }
+                                .onFailure { status = ExperimentStatus.Error(it.message ?: "Host check failed.") }
+                        }
+                    }
+                )
+            }
 
             ModelSelectionPanel(
                 availableModels = availableModels,
@@ -455,7 +484,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                 onSelectedAgentProfileChanged = { selectedAgentProfile = it },
                 onRefresh = {
                     coroutineScope.launch {
-                        client().getModels()
+                        imageAnalyzer.getModels()
                             .onSuccess { models ->
                                 syncSelectedModel(models)
                                 status = ExperimentStatus.Ready("Loaded ${models.size} model profile(s).")
@@ -509,6 +538,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
 
             VoiceQueryPanel(
                 transcript = voiceTranscript,
+                inferenceDestination = imageAnalyzer.destinationLabel,
                 onTranscriptChanged = { voiceTranscript = it },
                 onCaptureVoice = {
                     val permissionState = ContextCompat.checkSelfPermission(
@@ -528,20 +558,28 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                 bitmap = capturedBitmap,
                 captureSource = captureSource,
                 datCaptureEnabled = datState.isReadyForCapture,
+                analysisButtonLabel = if (BuildConfig.INFERENCE_MODE == "phone_local") {
+                    "Analyze locally"
+                } else {
+                    "Send to GB10"
+                },
                 onCaptureDatImage = {
-                    val bitmap = datController.captureFrame()
-                    if (bitmap == null) {
-                        status = datController.state.value.recentError?.let { ExperimentStatus.Error(it) }
-                            ?: ExperimentStatus.Error("DAT capture failed.")
-                    } else {
-                        capturedBitmap = bitmap
-                        captureSource = if (datController.state.value.supportsRealSdk) {
-                            CaptureSource.RayBanMetaDat
+                    status = ExperimentStatus.CapturingImage
+                    coroutineScope.launch {
+                        val bitmap = datController.captureFrame()
+                        if (bitmap == null) {
+                            status = datController.state.value.recentError?.let { ExperimentStatus.Error(it) }
+                                ?: ExperimentStatus.Error("DAT capture failed.")
                         } else {
-                            CaptureSource.Mock
+                            capturedBitmap = bitmap
+                            captureSource = if (datController.state.value.supportsRealSdk) {
+                                CaptureSource.RayBanMetaDat
+                            } else {
+                                CaptureSource.Mock
+                            }
+                            latestResponse = null
+                            status = ExperimentStatus.Ready("High-resolution photo captured from DAT.")
                         }
-                        latestResponse = null
-                        status = ExperimentStatus.Ready("Image captured from DAT session.")
                     }
                 },
                 onCapturePhoneImage = {
@@ -597,7 +635,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                 preferBluetoothSpeech = preferBluetoothSpeech,
                 speechRate = speechRate,
                 audioRouteState = audioRouteState,
-                latestSpeechText = latestResponse?.fullReadoutText().orEmpty(),
+                latestSpeechText = latestResponse?.spokenText().orEmpty(),
                 onSpeechEnabledChanged = {
                     speechEnabled = it
                     speechController.muted = !it
@@ -624,7 +662,7 @@ fun ExperimentApp(datPermissionBridge: DatPermissionBridge = NoOpDatPermissionBr
                 onStop = { speechController.stop() },
                 onReplay = {
                     coroutineScope.launch {
-                        speak(latestResponse?.fullReadoutText().orEmpty())
+                        speak(latestResponse?.spokenText().orEmpty())
                     }
                 }
             )
@@ -720,13 +758,14 @@ private fun LiveSamplingPanel(
 @Composable
 private fun VoiceQueryPanel(
     transcript: String,
+    inferenceDestination: String,
     onTranscriptChanged: (String) -> Unit,
     onCaptureVoice: () -> Unit,
     onClear: () -> Unit
 ) {
     Section(title = "Voice query") {
         Text(
-            text = "Phone microphone fallback is active. Raw audio is not stored; only the transcript is sent to the GB10 host.",
+            text = "Phone microphone fallback is active. Raw audio is not stored; only the transcript is used by $inferenceDestination.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -744,6 +783,20 @@ private fun VoiceQueryPanel(
             TextButton(onClick = onClear, enabled = transcript.isNotBlank()) {
                 Text("Clear")
             }
+        }
+    }
+}
+
+@Composable
+private fun LocalModelPanel(onCheckModel: () -> Unit) {
+    Section(title = "Phone local VLM") {
+        Text(
+            text = "FastVLM-1.5B runs on this phone. The model is delivered once during setup; images and prompts stay on-device.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Button(onClick = onCheckModel) {
+            Text("Check model")
         }
     }
 }
@@ -846,7 +899,7 @@ private fun ModelSelectionPanel(
 ) {
     Section(title = "Inference model") {
         Text(
-            text = "Exactly one GB10 model profile runs for each request.",
+            text = "Exactly one model profile runs for each request.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -919,6 +972,7 @@ private fun CapturePanel(
     bitmap: Bitmap?,
     captureSource: CaptureSource,
     datCaptureEnabled: Boolean,
+    analysisButtonLabel: String,
     onCaptureDatImage: () -> Unit,
     onCapturePhoneImage: () -> Unit,
     onSendImage: () -> Unit
@@ -963,7 +1017,7 @@ private fun CapturePanel(
                     Text("Phone")
                 }
                 Button(onClick = onSendImage) {
-                    Text("Send to GB10")
+                    Text(analysisButtonLabel)
                 }
             }
         }
@@ -1169,10 +1223,22 @@ private fun Section(title: String, content: @Composable ColumnScope.() -> Unit) 
 
 private fun ExperimentStatus.messageText(): String =
     when (this) {
-        ExperimentStatus.Idle -> "Connect to the GB10 host, capture a still image, then send it for local analysis."
-        ExperimentStatus.CheckingHost -> "Checking GB10 host..."
+        ExperimentStatus.Idle -> if (BuildConfig.INFERENCE_MODE == "phone_local") {
+            "Check the local model, capture a still image, then analyze it on this phone."
+        } else {
+            "Connect to the GB10 host, capture a still image, then send it for local analysis."
+        }
+        ExperimentStatus.CheckingHost -> if (BuildConfig.INFERENCE_MODE == "phone_local") {
+            "Checking local model..."
+        } else {
+            "Checking GB10 host..."
+        }
         ExperimentStatus.CapturingImage -> "Opening camera..."
-        ExperimentStatus.SendingImage -> "Sending image to GB10..."
+        ExperimentStatus.SendingImage -> if (BuildConfig.INFERENCE_MODE == "phone_local") {
+            "Running FastVLM on this phone..."
+        } else {
+            "Sending image to GB10..."
+        }
         is ExperimentStatus.Ready -> message
         is ExperimentStatus.Error -> message
     }
@@ -1197,6 +1263,9 @@ private fun AnalyzeImageResponse.fullReadoutText(): String {
         results.firstOrNull()?.answer?.trim().orEmpty().ifBlank { speechText }
     }
 }
+
+private fun AnalyzeImageResponse.spokenText(): String =
+    fullReadoutText().ifBlank { speechText.trim() }
 
 @Preview(showBackground = true)
 @Composable

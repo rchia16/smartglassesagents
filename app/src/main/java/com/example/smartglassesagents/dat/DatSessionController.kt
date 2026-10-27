@@ -13,5 +13,5 @@ interface DatSessionController {
     fun requestCameraPermission()
     fun startSession()
     fun stopSession()
-    fun captureFrame(): Bitmap?
+    suspend fun captureFrame(): Bitmap?
 }

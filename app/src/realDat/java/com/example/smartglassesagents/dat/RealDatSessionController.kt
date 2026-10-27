@@ -10,8 +10,9 @@ import android.graphics.Rect
 import android.graphics.YuvImage
 import android.util.Log
 import androidx.exifinterface.media.ExifInterface
+import com.meta.wearable.dat.camera.Camera
 import com.meta.wearable.dat.camera.Stream
-import com.meta.wearable.dat.camera.addStream
+import com.meta.wearable.dat.camera.addCamera
 import com.meta.wearable.dat.camera.types.PhotoData
 import com.meta.wearable.dat.camera.types.StreamConfiguration
 import com.meta.wearable.dat.camera.types.StreamState
@@ -68,6 +69,7 @@ class RealDatSessionController(
     private var monitoringStarted = false
     private var activeDevice: DeviceIdentifier? = null
     private var coreSession: DeviceSession? = null
+    private var camera: Camera? = null
     private var stream: Stream? = null
     private var latestFrame: Bitmap? = null
     private var registrationJob: Job? = null
@@ -76,6 +78,7 @@ class RealDatSessionController(
     private var deviceSessionJob: Job? = null
     private var sessionErrorJob: Job? = null
     private var streamErrorJob: Job? = null
+    private var cameraStateJob: Job? = null
     private var stateJob: Job? = null
     private var videoJob: Job? = null
     private var terminalStartupError: String? = null
@@ -228,6 +231,8 @@ class RealDatSessionController(
         Log.i(TAG, "Stopping DAT session")
         streamErrorJob?.cancel()
         streamErrorJob = null
+        cameraStateJob?.cancel()
+        cameraStateJob = null
         sessionErrorJob?.cancel()
         sessionErrorJob = null
         deviceSessionJob?.cancel()
@@ -236,8 +241,11 @@ class RealDatSessionController(
         stateJob = null
         videoJob?.cancel()
         videoJob = null
+        runCatching { stream?.stop() }
+        runCatching { camera?.stop() }
         runCatching { coreSession?.stop() }
         coreSession = null
+        camera = null
         stream = null
         latestFrame = null
         terminalStartupError = null
@@ -255,6 +263,8 @@ class RealDatSessionController(
     private fun stopSessionForRestart() {
         streamErrorJob?.cancel()
         streamErrorJob = null
+        cameraStateJob?.cancel()
+        cameraStateJob = null
         sessionErrorJob?.cancel()
         sessionErrorJob = null
         deviceSessionJob?.cancel()
@@ -265,14 +275,16 @@ class RealDatSessionController(
         videoJob = null
 
         runCatching { stream?.stop() }
+        runCatching { camera?.stop() }
         runCatching { coreSession?.stop() }
 
         stream = null
+        camera = null
         coreSession = null
         latestFrame = null
     }
 
-    override fun captureFrame(): Bitmap? {
+    override suspend fun captureFrame(): Bitmap? {
         val currentStream = stream
         if (currentStream == null || _state.value.sessionStatus != DatSessionStatus.Running) {
             setError("Start a DAT stream session before capturing a frame.")
@@ -283,17 +295,16 @@ class RealDatSessionController(
             return latestFrame
         }
 
-        coroutineScope.launch {
-            currentStream.capturePhoto()
-                .onSuccess { photoData ->
-                    latestFrame = photoData.toBitmap()
-                }
-                .onFailure { error ->
-                    val detail = error.message ?: error::class.java.simpleName
-                    setError("DAT photo capture failed: $detail. Using latest stream frame if available.")
-                }
+        val photoResult = currentStream.capturePhoto()
+        val photoData = photoResult.getOrNull()
+        if (photoData == null) {
+            val detail = photoResult.errorOrNull()?.descriptionOrType()
+                ?: photoResult.exceptionOrNull()?.message
+                ?: "Unknown error"
+            setError("DAT photo capture failed: $detail.")
+            return latestFrame
         }
-        return latestFrame
+        return photoData.toBitmap().also { latestFrame = it }
     }
 
     private fun startStreamSession() {
@@ -395,17 +406,27 @@ class RealDatSessionController(
                 )
             }
 
-            val streamResult = session.addStream(
-                StreamConfiguration(videoQuality = VideoQuality.HIGH, 30),
+            val cameraResult = session.addCamera(
+                StreamConfiguration(videoQuality = VideoQuality.HIGH, frameRate = 15),
             )
 
-            val createdStream = streamResult.getOrNull()
-            if (createdStream == null) {
-                Log.e(TAG, "DAT stream creation failed: ${streamResult.failureDescription()}")
-                setError("DAT stream creation failed: ${streamResult.failureDescription()}.")
+            val createdCamera = cameraResult.getOrNull()
+            if (createdCamera == null) {
+                Log.e(TAG, "DAT camera creation failed: ${cameraResult.failureDescription()}")
+                setError("DAT camera creation failed: ${cameraResult.failureDescription()}.")
                 cleanupFailedStart(session)
                 return@launch
             }
+            camera = createdCamera
+
+            cameraStateJob?.cancel()
+            cameraStateJob = coroutineScope.launch {
+                createdCamera.state.collect { cameraState ->
+                    Log.i(TAG, "Camera state: $cameraState")
+                }
+            }
+
+            val createdStream = createdCamera.stream
             stream = createdStream
 
             stateJob?.cancel()
@@ -479,6 +500,8 @@ class RealDatSessionController(
     private fun cleanupFailedStart(session: DeviceSession) {
         streamErrorJob?.cancel()
         streamErrorJob = null
+        cameraStateJob?.cancel()
+        cameraStateJob = null
         stateJob?.cancel()
         stateJob = null
         videoJob?.cancel()
@@ -488,8 +511,10 @@ class RealDatSessionController(
         sessionErrorJob?.cancel()
         sessionErrorJob = null
         runCatching { stream?.stop() }
+        runCatching { camera?.stop() }
         runCatching { session.stop() }
         stream = null
+        camera = null
         coreSession = null
         latestFrame = null
     }
@@ -522,9 +547,6 @@ class RealDatSessionController(
                 DeviceSessionError.DEVICE_DISCONNECTED ->
                     "DAT cannot start because the glasses disconnected."
 
-                DeviceSessionError.DEVICE_POWERED_OFF ->
-                    "DAT cannot start because the glasses are powered off."
-
                 else -> "DAT session error: ${descriptionOrType()}"
             },
             isTerminal = this != DeviceSessionError.SESSION_ENDED_BY_DEVICE,
@@ -548,7 +570,10 @@ class RealDatSessionController(
 
         return runCatching {
             val failure = this::class.java.methods
-                .firstOrNull { it.name == "failureOrNull" && it.parameterCount == 0 }
+                .firstOrNull {
+                    it.parameterCount == 0 &&
+                        (it.name == "errorOrNull" || it.name == "failureOrNull")
+                }
                 ?.invoke(this)
 
             when (failure) {

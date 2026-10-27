@@ -25,3 +25,7 @@ gb10-host/data/
 .idea/
 *.iml
 */build/
+models/
+.tmp-mnn-*/
+.tmp-mnn-*.apk
+fastvlm_assets/src/main/assets/FastVLM-1.5B-Stage3-MNN/
